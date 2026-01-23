@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-"""
+r"""controller.py
+
 Windows "visible cowork" controller core:
+
 - OS-level mouse/keyboard control via SendInput (ctypes)
-- JSON command protocol over stdin/stdout
-- Emergency stop: press ESC anytime (global hook) -> releases all + exits
-- Optional "step mode": require an explicit {"op":"approve"} between actions
+- JSON command protocol over stdin/stdout (one JSON object per line)
+- Emergency stop: press ESC anytime (global, no window focus required)
+  - Releases held inputs
+  - Terminates the process *immediately* (hard exit) to avoid hangs
+- Optional "step mode": require an explicit {"op":"approve"} before allowing
+  the next action(s)
 
-Usage (manual testing):
-  python win_controls_server.py
+Usage (manual testing, PowerShell):
 
-Then in another terminal:
-  echo {"op":"move","x":300,"y":300} | python win_controls_server.py
+  # Run interactive server
+  python .\controller.py
 
-Better: run it interactively and paste JSON lines.
+  # Send a single command
+  '{"op":"move","x":300,"y":300}' | python .\controller.py
 
-Protocol: one JSON object per line.
-Responses: one JSON object per line.
+Protocol:
+- One JSON object per line in stdin.
+- One JSON response per line in stdout.
 """
 
 from __future__ import annotations
 
 import ctypes
 import json
+import os
 import sys
 import time
 import threading
@@ -29,7 +36,6 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Sequence
-
 
 # ---------------------------
 # Input backend (SendInput)
@@ -330,21 +336,24 @@ class EmergencyStop:
         self._stop_evt.set()
 
     def _run(self) -> None:
-        # Detect a down transition (high bit set)
+        # Detect a key-down state (high bit set)
         while not self._stop_evt.is_set():
             state = self.GetAsyncKeyState(self.VK_ESCAPE)
             if state & 0x8000:
                 try:
                     self.on_stop()
                 finally:
-                    # ensure we terminate process
-                    os_exit(2)
+                    # Ensure we terminate the process even if other threads are blocked.
+                    hard_exit(2)
             time.sleep(0.01)
 
 
-def os_exit(code: int) -> None:
-    # Fast exit (avoid deadlocks)
-    raise SystemExit(code)
+def hard_exit(code: int) -> None:
+    """Terminate the process immediately.
+
+    Used for emergency stop to avoid deadlocks caused by blocked threads.
+    """
+    os._exit(int(code))
 
 
 # ---------------------------
@@ -361,17 +370,29 @@ class ControlsServer:
         self._approved = threading.Event()
         self._approved.set()  # default: not in step mode
         self._pending_actions = 0
+        self._stop_evt = threading.Event()
 
         if self.c.config.step_mode:
             self._approved.clear()
 
+    def stop(self) -> None:
+        """Request the server to stop waiting for approvals."""
+        self._stop_evt.set()
+        self._approved.set()
+
     def _require_approval_if_needed(self) -> None:
         if not self.c.config.step_mode:
             return
-        # allow N actions after approval
+
+        # Allow N actions after an approval.
         if self._pending_actions <= 0:
-            # block until approved or ESC kills us
-            self._approved.wait()
+            # Don't block forever: loop with timeout so stop/shutdown can interrupt.
+            while not self._stop_evt.is_set():
+                if self._approved.wait(timeout=0.1):
+                    break
+            if self._stop_evt.is_set():
+                raise CommandError("Server stopping while waiting for approval")
+
             self._approved.clear()
             self._pending_actions = max(1, self.c.config.max_actions_without_approval)
 
@@ -392,7 +413,8 @@ class ControlsServer:
 
         if op == "stop":
             self.c.release_all()
-            os_exit(0)
+            self.stop()
+            hard_exit(0)
 
         # data-plane operations require approval (if step_mode)
         self._require_approval_if_needed()
@@ -488,9 +510,17 @@ def main() -> None:
             raise
         except Exception as e:
             # keep running; return structured error
-            write({"ok": False, "error": str(e)})
+            write(
+                {
+                    "ok": False,
+                    "op": str(msg.get("op")) if isinstance(locals().get("msg"), dict) else None,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                }
+            )
 
     # stdin closed -> cleanup
+    server.stop()
     controls.release_all()
     estop.stop()
 

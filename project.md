@@ -146,6 +146,13 @@ If parsing fails, retry with a stricter system prompt.
 
 Each action is a JSON object with an `"op"` field.
 
+> Note: When "Step Mode" is enabled, the controller/server may require an explicit
+> control-plane approval message before executing the next action batch:
+>
+> ```json
+> {"op":"approve"}
+> ```
+
 #### Mouse
 
 ```json
