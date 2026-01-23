@@ -39,7 +39,7 @@ The repo currently includes a Windows input controller that reads **one JSON obj
 ### Run (interactive)
 
 ```powershell
-python .\controller.py
+python -m desktop_agent.controller
 ```
 
 ### Send a single command
@@ -47,7 +47,7 @@ python .\controller.py
 PowerShell example (prints a JSON line into the process):
 
 ```powershell
-'{"op":"move","x":300,"y":300}' | python .\controller.py
+'{"op":"move","x":300,"y":300}' | python -m desktop_agent.controller
 ```
 
 ### Stop

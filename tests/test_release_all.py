@@ -1,4 +1,4 @@
-import controller
+from desktop_agent import controller
 
 
 class FakeWindowsControls(controller.WindowsControls):

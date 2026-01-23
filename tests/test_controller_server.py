@@ -1,6 +1,6 @@
 import pytest
 
-import controller
+from desktop_agent import controller
 
 
 class FakeControls:

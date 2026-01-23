@@ -24,7 +24,7 @@ This file tracks the immediate cleanup tasks identified after reviewing `project
   - Ensure `stop` can interrupt a pending approval wait.
   - Rationale: currently `_approved.wait()` can hang forever unless an `approve` message arrives (or ESC is pressed).
 
-- [x] **Align step-mode protocol with `project.md`**
+- [x] **Align step-mode protocol with `project.md`
   - Either:
     - document the `{"op": "approve"}` control-plane op in `project.md`, or
     - remove `approve` from the controller and implement step-mode at the executor/planner layer.
@@ -58,3 +58,10 @@ This file tracks the immediate cleanup tasks identified after reviewing `project
     - invalid payloads return structured errors
   - Add tests for `WindowsControls.release_all()` bookkeeping (without calling real SendInput).
   - Provide a small fake/stub controls implementation so CI can run on any machine without generating real input.
+
+## Project structure
+
+- [x] **Migrate to `src/` layout package**
+  - Move core code into `src/desktop_agent/`.
+  - Add `pyproject.toml` so the package can be installed (editable) and imported reliably.
+  - Update tests and docs to import and run via `desktop_agent.*`.
