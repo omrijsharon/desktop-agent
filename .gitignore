@@ -5,6 +5,10 @@ __pycache__/
 *.pyo
 *.pynb
 
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
 # Virtual environments
 .venv/
 venv/
@@ -14,6 +18,9 @@ ENV/
 *.egg-info/
 dist/
 build/
+
+# Editable install metadata
+*.egg-info/
 
 # Logs
 *.log
