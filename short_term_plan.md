@@ -65,3 +65,21 @@ This file tracks the immediate cleanup tasks identified after reviewing `project
   - Move core code into `src/desktop_agent/`.
   - Add `pyproject.toml` so the package can be installed (editable) and imported reliably.
   - Update tests and docs to import and run via `desktop_agent.*`.
+
+## Next iteration
+
+- [ ] **Add CI (GitHub Actions) to run tests on push/PR**
+  - Add a workflow that runs `pytest` on a Windows runner.
+  - Install project + dev requirements (`pip install -e .` and `pip install -r requirements-dev.txt`).
+
+- [ ] **Clean up and ignore `__pycache__/` artifacts**
+  - Ensure `__pycache__/` and `*.pyc` are ignored via `.gitignore`.
+  - Remove any accidentally committed `__pycache__/` directories from the repo.
+
+- [ ] **Add a controller smoke test target**
+  - Add a minimal automated check that `python -m desktop_agent.controller` starts and responds to `{"op":"ping"}`.
+  - Optionally expose it as a VS Code task (or a simple script) for quick local verification.
+
+- [ ] **Start `protocol.py` (action schema + validation) with unit tests**
+  - Define TypedDicts/dataclasses for actions described in `project.md`.
+  - Add validation helpers and unit tests for protocol parsing/validation.
