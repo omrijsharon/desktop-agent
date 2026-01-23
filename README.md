@@ -20,6 +20,18 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
+### 3) Install dev/test dependencies (optional)
+
+```powershell
+pip install -r requirements-dev.txt
+```
+
+## Running tests
+
+```powershell
+pytest -q
+```
+
 ## Controller (manual testing)
 
 The repo currently includes a Windows input controller that reads **one JSON object per line** from `stdin` and writes **one JSON response per line** to `stdout`.
