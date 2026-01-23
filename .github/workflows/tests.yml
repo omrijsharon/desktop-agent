@@ -24,7 +24,12 @@ jobs:
           python -m pip install -e .
           python -m pip install -r requirements-dev.txt
 
-      - name: Run tests
+      - name: Run unit tests
         shell: pwsh
         run: |
           pytest -q
+
+      - name: Run controller smoke test
+        shell: pwsh
+        run: |
+          python .\scripts\controller_smoke_test.py
