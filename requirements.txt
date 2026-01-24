@@ -1,6 +1,8 @@
+# Runtime dependencies
+mss
+pillow
+
 # Add runtime dependencies here as they are introduced.
 # Example (later):
-# mss
-# pillow
 # pyside6
 # openai
