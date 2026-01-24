@@ -60,30 +60,30 @@ Supported MVP capabilities:
 
 ### 0) Establish module/package skeleton
 
-- [ ] Create stubs (with minimal docstrings) for:
-  - `src/desktop_agent/vision.py`
-  - `src/desktop_agent/llm.py`
-  - `src/desktop_agent/executor.py`
-  - `src/desktop_agent/planner.py`
-  - `src/desktop_agent/ui.py`
-  - `src/desktop_agent/main.py`
-  - `src/desktop_agent/config.py`
-- [ ] Add/update tests where pure logic exists (protocol/validation/state machines).
+- [x] Create stubs (with minimal docstrings) for:
+  - `src/desktop_agent/vision.py` ✅ (implemented)
+  - `src/desktop_agent/llm.py` ✅ (implemented)
+  - `src/desktop_agent/executor.py` ✅ (implemented)
+  - `src/desktop_agent/planner.py` ✅ (implemented)
+  - `src/desktop_agent/ui.py` ✅ (implemented)
+  - `src/desktop_agent/main.py` ✅ (implemented)
+  - `src/desktop_agent/config.py` ✅ (implemented)
+- [x] Add/update tests where pure logic exists (protocol/validation/state machines).
 
 ### 1) Vision subsystem (`vision.py`)
 
 Goal: fast screenshot capture + conversion helpers.
 
-- [ ] Add dependencies:
+- [x] Add dependencies:
   - `mss` (capture)
   - `Pillow` (image conversion/scaling)
-- [ ] Implement `ScreenCapture` service:
+- [x] Implement `ScreenCapture` service:
   - capture full virtual screen
   - return raw bytes (PNG/JPEG) and optionally a PIL image / numpy array
   - return width/height and monitor bounds
-- [ ] Implement coordinate conversion utilities:
+- [x] Implement coordinate conversion utilities:
   - real screen ↔ scaled preview mapping
-- [ ] Unit tests:
+- [x] Unit tests:
   - pure conversion helpers
   - image encoding utilities (no real screen required)
 
@@ -91,15 +91,15 @@ Goal: fast screenshot capture + conversion helpers.
 
 Goal: given goal + screenshot(s), return **strict structured JSON**: `high_level`, `actions`, `notes`.
 
-- [ ] Decide provider for MVP (OpenAI first per `project.md`).
-- [ ] Add dependency (likely `openai`).
-- [ ] Implement a small adapter:
+- [x] Decide provider for MVP (OpenAI first per `project.md`).
+- [x] Add dependency (likely `openai`).
+- [x] Implement a small adapter:
   - build messages (system + user)
   - optionally include screenshot as image input
   - enforce JSON-only reply
   - parse response strictly, retry with stricter prompt on failure
-- [ ] Validate returned `actions` using `desktop_agent.protocol.validate_actions()`.
-- [ ] Unit tests:
+- [x] Validate returned `actions` using `desktop_agent.protocol.validate_actions()`.
+- [x] Unit tests:
   - parsing/validation of mock LLM responses
   - retry logic when JSON parsing fails
 
@@ -113,19 +113,19 @@ MVP design choice:
 
 Tasks:
 
-- [ ] Implement `Executor` with:
+- [x] Implement `Executor` with:
   - `execute(actions)`
   - configurable rate limit (`max_actions_per_second`)
   - optional coordinate bounds checks using virtual screen metrics
   - per-batch timeout
   - `release_all()` on exception
-- [ ] Implement **pause/resume/stop**:
+- [x] Implement **pause/resume/stop**:
   - pause = block execution until resumed
   - stop = immediately `release_all()` and abort
-- [ ] Implement Step Mode integration:
+- [x] Implement Step Mode integration:
   - action-level approval via callback/hook: `requires_approval(action_batch) → bool`
   - executor should be able to block waiting for approval without blocking UI thread
-- [ ] Unit tests:
+- [x] Unit tests:
   - use a fake controls backend to ensure executor sends expected calls
   - test pause/stop behavior
 
@@ -133,19 +133,19 @@ Tasks:
 
 Goal: the main agent loop and safe incremental planning.
 
-- [ ] Implement state machine (as described in `project.md`):
+- [x] Implement state machine (as described in `project.md`):
   - `IDLE → PLANNING → EXECUTING → WAITING_FOR_USER → DONE/ERROR`
-- [ ] Planner loop:
+- [x] Planner loop:
   - capture screenshot
   - call LLM for a small batch of actions
   - validate actions
   - hand to executor
   - post high-level updates continuously
   - re-observe often (avoid long chains)
-- [ ] Keep history:
+- [x] Keep history:
   - last N actions + outcomes
   - last screenshot metadata (not necessarily bytes)
-- [ ] Unit tests:
+- [x] Unit tests:
   - state transitions
   - ensures planner never emits unvalidated actions
 
@@ -153,27 +153,27 @@ Goal: the main agent loop and safe incremental planning.
 
 Goal: a small, always-on-top (optional) chat UI that is docked right by default and draggable.
 
-- [ ] Choose UI toolkit (**PySide6** recommended in `project.md`).
-- [ ] Implement window:
+- [x] Choose UI toolkit (**PySide6** recommended in `project.md`).
+- [x] Implement window:
   - chat history
   - user input + send
   - status indicator (RUNNING/PAUSED/STOPPED)
   - high-level plan feed (live)
   - optional low-level action feed
-- [ ] Implement docking behavior:
+- [x] Implement docking behavior:
   - initial right-dock
   - drag anywhere
   - optional snap-to-edge threshold
-- [ ] Thread-safe update API:
+- [x] Thread-safe update API:
   - agent thread can call something like `ui.post_message(...)` safely
 
 ### 6) Wiring / lifecycle (`main.py` + `config.py`)
 
 Goal: start UI, start agent thread, handle shutdown.
 
-- [ ] `config.py`
+- [x] `config.py`
   - load env vars / config for model key, step-mode, always-on-top, etc.
-- [ ] `main.py`
+- [x] `main.py`
   - start UI thread
   - start agent worker thread
   - connect queues/signals for UI updates
@@ -185,7 +185,7 @@ Goal: start UI, start agent thread, handle shutdown.
 
 Goal: reproduce `project.md` success criteria.
 
-- [ ] Provide a minimal run path:
+- [x] Provide a minimal run path:
   - `python -m desktop_agent.main` (or similar)
 - [ ] Manual test checklist:
   - UI appears docked right
@@ -194,6 +194,67 @@ Goal: reproduce `project.md` success criteria.
   - agent executes visible actions
   - agent keeps updating intent
   - ESC stops immediately
+
+---
+
+## Nice-to-have / contingency: two-stage planning (planner → action translator)
+
+If the single-model approach struggles (e.g., fragile coordinate selection, overly long action chains, or repeated invalid actions), consider splitting planning into **two stages**:
+
+1) **High-level planner** (intent): decides *what* to do next in human terms (small, incremental step).
+2) **Low-level action translator** (execution plan): converts that intent into the strict `desktop_agent.protocol.Action` list for the controller/executor.
+
+### Why we might need this
+
+- **Reliability:** a “translator” can be prompted/validated to be extremely strict and conservative, reducing malformed actions.
+- **Safety:** translator can refuse when targets are uncertain (return `actions: []`) and force step-mode confirmation for destructive operations.
+- **Maintainability:** prompts and logic for “what to do” vs “how to click/type” evolve independently.
+- **Model flexibility:** the translator can be a cheaper model (or even deterministic code) while the planner uses a stronger model.
+
+### Tradeoffs / costs
+
+- **Latency + cost:** potentially one extra model call per loop.
+- **More plumbing:** additional types/schemas, logs, tests, and debugging surface.
+- **Failure modes:** planner/translator mismatch (planner expects capabilities translator doesn’t have).
+
+### Implementation approach (tasks)
+
+A recommended path is to try **deterministic translation first**, and only add a second LLM translator if needed.
+
+#### A) Deterministic translator (preferred first step)
+
+- [ ] Define an intermediate “intent schema” (separate from low-level actions), e.g.:
+  - click a UI element by *description* ("Click the Search box")
+  - type text into a target field ("Type 'hello' into the active input")
+  - open start menu, focus window, etc. (keep the list small)
+- [ ] Add `desktop_agent/intent.py`:
+  - TypedDicts + validation for the intent schema
+  - mapping intent → `protocol.Action[]` using heuristics (focus-first, small moves)
+- [ ] Extend `vision.py` (optional):
+  - lightweight target helpers (e.g., click center of screen quadrant, or provide a “cursor hint”)
+  - keep it heuristic-only in MVP (no OCR dependency unless necessary)
+- [ ] Update planner loop:
+  - LLM returns intent JSON
+  - deterministic translator converts intent → actions
+  - executor runs actions as usual
+- [ ] Tests:
+  - validation tests for intent schema
+  - unit tests for intent → action mapping (pure logic)
+
+#### B) Second LLM translator (fallback if A is insufficient)
+
+- [ ] Add `TranslatorLLM` (parallel to `PlannerLLM`) with its own strict prompt:
+  - Input: screenshot + high-level intent + constraints
+  - Output: `high_level/actions/notes` with actions **only** (schema locked)
+  - Must be conservative: if uncertain, output `actions: []` and explain.
+- [ ] Add config switches:
+  - enable/disable translator stage
+  - separate model selection for translator (default to smaller model)
+- [ ] Logging + observability:
+  - persist planner-intent, translator-actions, and validation failures for debugging
+- [ ] Tests:
+  - mock translator responses and ensure strict validation + retry-on-parse-failure works
+  - ensure step-mode gating still works correctly end-to-end
 
 ---
 

@@ -1,8 +1,9 @@
 # Runtime dependencies
 mss
 pillow
+openai>=1.0.0
+PySide6>=6.6
 
 # Add runtime dependencies here as they are introduced.
 # Example (later):
 # pyside6
-# openai

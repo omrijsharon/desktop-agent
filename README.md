@@ -32,6 +32,25 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
+## Tests
+
+### PowerShell (recommended)
+
+Run tests without any PowerShell scripts (works even when `.ps1` execution is disabled):
+
+- From repo root:
+  - `.\\.venv\\Scripts\\python -m pytest -q`
+
+- From anywhere:
+  - `& "C:\\Users\\tamipinhasi\\Documents\\repos\\desktop-agent\\.venv\\Scripts\\python.exe" -m pytest -q`
+
+Note: `cd /d ...` is **cmd.exe** syntax and will error in PowerShell. If you need to change directories in PowerShell, use:
+`Set-Location "C:\\Users\\tamipinhasi\\Documents\\repos\\desktop-agent"`
+
+### Optional helper script
+
+`scripts/pytest.ps1` exists, but it requires PowerShell script execution to be enabled on your system.
+
 ## Controller (manual testing)
 
 The repo currently includes a Windows input controller that reads **one JSON object per line** from `stdin` and writes **one JSON response per line** to `stdout`.
@@ -55,7 +74,22 @@ PowerShell example (prints a JSON line into the process):
 - Press **ESC** for emergency stop (releases held inputs)
 - Or send `{"op":"stop"}`
 
+## Run (MVP UI)
+
+From repo root (PowerShell):
+
+- `./.venv/Scripts/python -m desktop_agent.main`
+
+Environment variables:
+
+- `OPENAI_API_KEY` (required to get real plans)
+- `OPENAI_MODEL` (optional; default `gpt-4o-mini`)
+- `DESKTOP_AGENT_FAKE_LLM` (optional; `1` forces fake mode even if an API key exists)
+- `STEP_MODE` (optional; `1` enables step mode by default)
+- `ALWAYS_ON_TOP` (optional; `1` keeps the window above others)
+
 ## Docs
 
 - `project.md` – product requirements and architecture notes
 - `short_term_plan.md` – immediate tasks / cleanup checklist
+- `docs/gpt-5-2_prompting_guide.md` – local copy of the OpenAI GPT‑5.2 prompting guide (converted from HTML)
