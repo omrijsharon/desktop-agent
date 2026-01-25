@@ -39,3 +39,13 @@ def test_validate_actions_list_ok():
 def test_validate_unknown_op():
     with pytest.raises(ProtocolError):
         validate_action({"op": "nope"})
+
+
+def test_validate_move_delta_ok():
+    a = validate_action({"op": "move_delta", "dx": 5, "dy": -7})
+    assert a["op"] == "move_delta"
+
+
+def test_validate_move_delta_missing_fields():
+    with pytest.raises(ProtocolError):
+        validate_action({"op": "move_delta", "dx": 1})

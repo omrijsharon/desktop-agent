@@ -23,6 +23,12 @@ class MoveAction(TypedDict):
     y: int
 
 
+class MoveDeltaAction(TypedDict):
+    op: Literal["move_delta"]
+    dx: int
+    dy: int
+
+
 class ClickAction(TypedDict, total=False):
     op: Literal["click"]
     button: Literal["left", "right", "middle"]
@@ -83,6 +89,7 @@ class StopAction(TypedDict):
 
 Action = (
     MoveAction
+    | MoveDeltaAction
     | ClickAction
     | MouseDownAction
     | MouseUpAction
@@ -144,6 +151,11 @@ def validate_action(action: Any) -> Action:
         _require_int(action, "x")
         _require_int(action, "y")
         return cast(MoveAction, action)
+
+    if op == "move_delta":
+        _require_int(action, "dx")
+        _require_int(action, "dy")
+        return cast(MoveDeltaAction, action)
 
     if op in {"click", "mouse_down", "mouse_up"}:
         btn = action.get("button", "left")

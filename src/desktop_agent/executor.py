@@ -29,6 +29,8 @@ class Controls(Protocol):
 
     def move(self, x: int, y: int) -> None: ...
 
+    def move_delta(self, dx: int, dy: int) -> None: ...
+
     def click(self, button: str = "left") -> None: ...
 
     def mouse_down(self, button: str = "left") -> None: ...
@@ -195,6 +197,14 @@ class Executor:
             y = int(action["y"])
             self._bounds_check(x, y)
             self._controls.move(x, y)
+            return
+
+        if op == "move_delta":
+            dx = int(action.get("dx", 0))
+            dy = int(action.get("dy", 0))
+            # Bounds checking for relative moves would require current cursor position.
+            # Keep MVP simple: rely on controller OS clamping and executor rate limits.
+            self._controls.move_delta(dx, dy)
             return
 
         if op == "click":

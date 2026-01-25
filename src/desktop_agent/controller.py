@@ -220,6 +220,12 @@ class WindowsControls:
         ay = int((y - vy) * 65535 / max(1, vh - 1))
         self._send_mouse(ax, ay, self.MOUSEEVENTF_MOVE | self.MOUSEEVENTF_ABSOLUTE)
 
+    def move_mouse_delta(self, dx: int, dy: int) -> None:
+        """Move the mouse relative to its current position."""
+
+        # Relative motion uses MOUSEEVENTF_MOVE without ABSOLUTE.
+        self._send_mouse(int(dx), int(dy), self.MOUSEEVENTF_MOVE)
+
     def mouse_down(self, button: MouseButton = MouseButton.LEFT) -> None:
         if button == MouseButton.LEFT:
             self._send_mouse(0, 0, self.MOUSEEVENTF_LEFTDOWN)
@@ -304,6 +310,18 @@ class WindowsControls:
                 pass
         self._held_buttons.clear()
         self._held_keys.clear()
+
+    # ---- Convenience aliases (used by in-process Executor) ----
+
+    def move(self, x: int, y: int) -> None:
+        self.move_mouse(x, y)
+
+    def move_delta(self, dx: int, dy: int) -> None:
+        self.move_mouse_delta(dx, dy)
+
+    def type(self, text: str) -> None:
+        # Executor expects `type(text)`; controller exposes `type_text`.
+        self.type_text(text)
 
 
 # ---------------------------
@@ -423,6 +441,11 @@ class ControlsServer:
         if op == "move":
             x = int(msg["x"]); y = int(msg["y"])
             self.c.move_mouse(x, y)
+            return {"ok": True, "op": op}
+
+        if op == "move_delta":
+            dx = int(msg.get("dx", 0)); dy = int(msg.get("dy", 0))
+            self.c.move_mouse_delta(dx, dy)
             return {"ok": True, "op": op}
 
         if op == "click":

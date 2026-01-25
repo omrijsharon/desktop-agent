@@ -50,6 +50,7 @@ def main() -> None:
         ui.set_controls_enabled(running=True)
         ui.post_status(state="PLANNING", high_level="Starting")
 
+        # `PlannerLLM` reads the API key from env (loaded from `.env` by config.py).
         llm = PlannerLLM(config=LLMConfig(model=model))
 
         planner = Planner(
@@ -97,8 +98,22 @@ def main() -> None:
         on_approve=on_approve,
     )
 
-    if not cfg.openai_api_key:
+    # Show a single startup note about whether we will use real calls.
+    # Fake mode can still be forced via `DESKTOP_AGENT_FAKE_LLM=1`.
+    force_fake = False
+    try:
+        import os
+
+        force_fake = os.environ.get("DESKTOP_AGENT_FAKE_LLM", "0") in {"1", "true", "True"}
+    except Exception:
+        force_fake = False
+
+    if force_fake:
+        ui.post_message("[SYSTEM] FAKE MODE forced via DESKTOP_AGENT_FAKE_LLM=1.")
+    elif not cfg.openai_api_key:
         ui.post_message("[SYSTEM] FAKE MODE enabled (no OPENAI_API_KEY). Set OPENAI_API_KEY to use the real model.")
+    else:
+        ui.post_message(f"[SYSTEM] Real mode enabled (model: {cfg.openai_model}).")
 
     ui.on_close(on_stop)
     ui.show()

@@ -26,6 +26,7 @@ def allowed_actions_text() -> str:
     return (
         "Allowed actions (return ONLY these ops):\n"
         "- move: {op:'move', x:int, y:int}\n"
+        "- move_delta: {op:'move_delta', dx:int, dy:int}\n"
         "- click: {op:'click', button:'left'|'right'|'middle'}\n"
         "- mouse_down: {op:'mouse_down', button:'left'|'right'|'middle'}\n"
         "- mouse_up: {op:'mouse_up', button:'left'|'right'|'middle'}\n"

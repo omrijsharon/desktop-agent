@@ -13,6 +13,9 @@ class StubControls:
     def move(self, x: int, y: int) -> None:
         self.calls.append(("move", (x, y)))
 
+    def move_delta(self, dx: int, dy: int) -> None:
+        self.calls.append(("move_delta", (dx, dy)))
+
     def click(self, button: str = "left") -> None:
         self.calls.append(("click", button))
 
@@ -47,12 +50,14 @@ def test_executor_executes_actions_in_order() -> None:
     ex.execute(
         [
             {"op": "move", "x": 10, "y": 20},
+            {"op": "move_delta", "dx": 5, "dy": -5},
             {"op": "click", "button": "left"},
             {"op": "type", "text": "hello"},
         ]
     )
     assert c.calls == [
         ("move", (10, 20)),
+        ("move_delta", (5, -5)),
         ("click", "left"),
         ("type", "hello"),
     ]

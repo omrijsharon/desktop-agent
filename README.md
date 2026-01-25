@@ -26,6 +26,21 @@ pip install -r requirements.txt
 pip install -r requirements-dev.txt
 ```
 
+## Configure API key (local dev)
+
+This repo reads the OpenAI key from the `OPENAI_API_KEY` environment variable.
+
+Recommended workflow:
+
+1) Copy the example file:
+   - `Copy-Item .env.example .env`
+2) Edit `.env` and set `OPENAI_API_KEY`.
+
+Notes:
+
+- `.env` is **git-ignored** and must never be committed.
+- `.env.example` is safe to commit and should contain only placeholders.
+
 ## Running tests
 
 ```powershell
