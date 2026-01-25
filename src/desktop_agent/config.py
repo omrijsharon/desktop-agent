@@ -62,7 +62,7 @@ SUPPORTED_MODELS: tuple[str, ...] = (
     "gpt-5-nano",
 )
 
-DEFAULT_MODEL: str = "gpt-5.2-2025-12-11"
+DEFAULT_MODEL: str = "gpt-5-nano"
 
 
 @dataclass(frozen=True)
