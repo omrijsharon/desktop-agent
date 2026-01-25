@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol, Sequence
 
 from .protocol import Action, ProtocolError, validate_actions
-from .prompts import system_prompt
+from .prompts import system_prompt, compiler_prompt, narrator_prompt
 
 
 # ---- Public types ----
@@ -125,11 +125,32 @@ class FakeLLMClient:
 
 
 # Centralized in `desktop_agent.prompts`.
-_SYSTEM_PROMPT = system_prompt()
+_SYSTEM_PROMPT = compiler_prompt()
+_NARRATOR_PROMPT = narrator_prompt()
 
 
-def _build_openai_input(*, goal: str, screenshot_png: Optional[bytes]) -> list[dict[str, Any]]:
+def _build_openai_input_narrator(*, goal: str, screenshot_png: Optional[bytes]) -> list[dict[str, Any]]:
     user_content: list[dict[str, Any]] = [{"type": "input_text", "text": f"Goal: {goal}"}]
+
+    if screenshot_png:
+        b64 = base64.b64encode(screenshot_png).decode("ascii")
+        user_content.append(
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{b64}",
+            }
+        )
+
+    return [
+        {"role": "system", "content": [{"type": "input_text", "text": _NARRATOR_PROMPT}]},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _build_openai_input_compiler(*, intent: str, screenshot_png: Optional[bytes]) -> list[dict[str, Any]]:
+    user_content: list[dict[str, Any]] = [
+        {"type": "input_text", "text": f"Intent: {intent.strip()}"},
+    ]
 
     if screenshot_png:
         b64 = base64.b64encode(screenshot_png).decode("ascii")
@@ -144,6 +165,20 @@ def _build_openai_input(*, goal: str, screenshot_png: Optional[bytes]) -> list[d
         {"role": "system", "content": [{"type": "input_text", "text": _SYSTEM_PROMPT}]},
         {"role": "user", "content": user_content},
     ]
+
+
+def _clean_intent_text(text: str) -> str:
+    # The narrator is instructed to output a single sentence. Be defensive.
+    s = (text or "").strip()
+    # Remove surrounding quotes if any.
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    # Take first non-empty line.
+    for line in s.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return s
 
 
 def _extract_json(text: str) -> str:
@@ -281,21 +316,52 @@ class PlannerLLM:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
 
+        # Fake client doesn't support a dedicated narrator stage; keep behavior stable.
+        if isinstance(self._client, FakeLLMClient):
+            inp = _build_openai_input(goal=goal, screenshot_png=screenshot_png)
+            txt = self._client.responses_create(model=self._cfg.model, input=inp)
+            return _parse_plan_json(txt)
+
+        # Stage 1: narrator intent (plain text)
         last_err: Optional[Exception] = None
+        intent: str = ""
         for attempt in range(self._cfg.max_retries + 1):
             try:
-                inp = _build_openai_input(goal=goal, screenshot_png=screenshot_png)
+                inp1 = _build_openai_input_narrator(goal=goal, screenshot_png=screenshot_png)
+                txt1 = self._client.responses_create(model=self._cfg.model, input=inp1)
+                intent = _clean_intent_text(txt1)
+                if not intent:
+                    raise LLMParseError("Narrator returned empty intent")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < self._cfg.max_retries:
+                    continue
+                raise LLMError(f"LLM narrator stage failed: {e}") from e
 
-                # Ask for strict JSON. The Responses API supports `text.format`.
-                txt = self._client.responses_create(
+        # Stage 2: compile intent to strict JSON actions
+        last_err = None
+        for attempt in range(self._cfg.max_retries + 1):
+            try:
+                inp2 = _build_openai_input_compiler(intent=intent, screenshot_png=screenshot_png)
+                txt2 = self._client.responses_create(
                     model=self._cfg.model,
-                    input=inp,
+                    input=inp2,
                     text={"format": {"type": "json_object"}},
                 )
-                return _parse_plan_json(txt)
+                plan = _parse_plan_json(txt2)
+
+                # Help observability: ensure the high_level references the intent.
+                if plan.high_level.strip() == "":
+                    plan = LLMPlan(
+                        high_level=intent,
+                        actions=plan.actions,
+                        notes=plan.notes,
+                        self_eval=plan.self_eval,
+                        verification_prompt=plan.verification_prompt,
+                    )
+                return plan
             except LLMParseError as e:
-                # If we got JSON but the *schema/actions* are invalid, retrying
-                # won't help; fail fast.
                 msg = str(e).lower()
                 if msg.startswith("invalid actions") or "high_level" in msg or "actions" in msg or "notes" in msg:
                     raise
@@ -303,17 +369,10 @@ class PlannerLLM:
                 if attempt < self._cfg.max_retries:
                     continue
                 raise
-            except LLMError as e:
-                last_err = e
-                if attempt < self._cfg.max_retries:
-                    continue
-                raise
             except Exception as e:
-                # Unexpected client errors (network, auth, etc.)
                 last_err = e
                 if attempt < self._cfg.max_retries:
                     continue
-                raise LLMError(str(e)) from e
+                raise LLMError(f"LLM compiler stage failed: {e}") from e
 
-        # Unreachable
         raise LLMError(f"LLM planning failed: {last_err}")

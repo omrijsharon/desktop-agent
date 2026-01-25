@@ -23,7 +23,8 @@ class FakeClient:
 def test_llm_parses_valid_json_and_validates_actions() -> None:
     client = FakeClient(
         [
-            '{"high_level":"Test","actions":[{"op":"move","x":1,"y":2}],"notes":"ok"}'
+            "Move the cursor slightly.",
+            '{"high_level":"Test","actions":[{"op":"move","x":1,"y":2}],"notes":"ok","self_eval":null,"verification_prompt":""}',
         ]
     )
     llm = PlannerLLM(client=client)
@@ -36,7 +37,8 @@ def test_llm_parses_valid_json_and_validates_actions() -> None:
 def test_llm_extracts_json_from_wrapped_text() -> None:
     client = FakeClient(
         [
-            'Here you go:\n```json\n{"high_level":"X","actions":[{"op":"click"}],"notes":""}\n```'
+            "Click the button.",
+            'Here you go:\n```json\n{"high_level":"X","actions":[{"op":"click"}],"notes":"","self_eval":null,"verification_prompt":""}\n```',
         ]
     )
     llm = PlannerLLM(client=client)
@@ -48,20 +50,23 @@ def test_llm_extracts_json_from_wrapped_text() -> None:
 def test_llm_retries_on_parse_error() -> None:
     client = FakeClient(
         [
+            "Move a bit.",
             "not json",
-            '{"high_level":"Ok","actions":[{"op":"type","text":"hi"}],"notes":""}',
+            '{"high_level":"Ok","actions":[{"op":"type","text":"hi"}],"notes":"","self_eval":null,"verification_prompt":""}',
         ]
     )
     llm = PlannerLLM(client=client)
     plan = llm.plan_next(goal="x")
     assert plan.high_level == "Ok"
-    assert client.calls == 2
+    # 1 narrator call + 2 compiler calls (retry)
+    assert client.calls == 3
 
 
 def test_llm_raises_on_invalid_actions() -> None:
     client = FakeClient(
         [
-            '{"high_level":"Bad","actions":[{"op":"move","x":"no","y":2}],"notes":""}'
+            "Move to the target.",
+            '{"high_level":"Bad","actions":[{"op":"move","x":"no","y":2}],"notes":"","self_eval":null,"verification_prompt":""}',
         ]
     )
     llm = PlannerLLM(client=client)
