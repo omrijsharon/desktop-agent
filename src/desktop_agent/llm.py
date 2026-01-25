@@ -340,21 +340,25 @@ class PlannerLLM:
         raise LLMError(f"LLM narrator stage failed: {last_err}")
 
     def translate_intent(self, *, intent: str, screenshot_png: Optional[bytes] = None) -> LLMPlan:
-        """Translator agent: compile a narrator intent into strict JSON actions."""
+        """Translator agent: compile a narrator intent into strict JSON actions.
+
+        Note: per the two-agent design, the translator does NOT receive a screenshot.
+        The `screenshot_png` arg is accepted for API compatibility but is ignored.
+        """
 
         if not isinstance(intent, str) or not intent.strip():
             raise ValueError("intent must be a non-empty string")
 
         # Fake client doesn't support staged translation; use canned action plan.
         if isinstance(self._client, FakeLLMClient):
-            inp = _build_openai_input(goal=intent, screenshot_png=screenshot_png)
+            inp = _build_openai_input(goal=intent, screenshot_png=None)
             txt = self._client.responses_create(model=self._cfg.model, input=inp)
             return _parse_plan_json(txt)
 
         last_err: Optional[Exception] = None
         for attempt in range(self._cfg.max_retries + 1):
             try:
-                inp2 = _build_openai_input_compiler(intent=intent, screenshot_png=screenshot_png)
+                inp2 = _build_openai_input_compiler(intent=intent, screenshot_png=None)
                 txt2 = self._client.responses_create(
                     model=self._cfg.model,
                     input=inp2,
@@ -378,10 +382,13 @@ class PlannerLLM:
         raise LLMError(f"LLM translator stage failed: {last_err}")
 
     def plan_next(self, *, goal: str, screenshot_png: Optional[bytes] = None) -> LLMPlan:
-        """Back-compat: compose narrator+translator using the same underlying model."""
+        """Back-compat: compose narrator+translator.
+
+        Narrator receives screenshot, translator receives intent only.
+        """
 
         intent = self.narrate_intent(goal=goal, screenshot_png=screenshot_png)
-        plan = self.translate_intent(intent=intent, screenshot_png=screenshot_png)
+        plan = self.translate_intent(intent=intent, screenshot_png=None)
 
         # Prefer translator's structured high_level; fall back to intent.
         if not plan.high_level.strip():

@@ -51,17 +51,15 @@ def _build_narrator_input(*, goal: str, screenshot_png: bytes) -> list[dict[str,
     ]
 
 
-def _build_translator_input(*, intent: str, screenshot_png: bytes) -> list[dict[str, Any]]:
+def _build_translator_input(*, intent: str) -> list[dict[str, Any]]:
     sys_prompt = compiler_prompt()
 
-    b64 = base64.b64encode(screenshot_png).decode("ascii")
     return [
         {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},
         {
             "role": "user",
             "content": [
                 {"type": "input_text", "text": f"Intent: {intent}"},
-                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
             ],
         },
     ]
@@ -78,20 +76,9 @@ def _clean_intent_text(txt: str) -> str:
     return s
 
 
-def _build_input(*, goal: str, screenshot_png: bytes) -> list[dict[str, Any]]:
-    sys_prompt = system_prompt()
-
-    b64 = base64.b64encode(screenshot_png).decode("ascii")
-    return [
-        {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": f"Goal: {goal}"},
-                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
-            ],
-        },
-    ]
+# NOTE: legacy single-stage builder kept for reference, but unused by this script.
+# def _build_input(...):
+# ...existing code...
 
 
 def main() -> int:
@@ -150,7 +137,7 @@ def main() -> int:
         print(f"\nNARRATOR INTENT: {intent}\n")
 
         # --- Translator stage (strict JSON actions) ---
-        inp = _build_translator_input(intent=intent, screenshot_png=screenshot_png)
+        inp = _build_translator_input(intent=intent)
 
         print(f"Calling translator (model): {cfg.openai_model}")
         txt = client.responses_create(
