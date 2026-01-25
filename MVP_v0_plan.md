@@ -308,3 +308,74 @@ Important: the self-evaluation data is **for logging/UI only**. The controller/e
   - parsing `self_eval` when present/absent
   - planner loop respecting `self_eval.status` to stop/continue
   - demo loop logic (can be tested with FakeLLMClient + stub controls)
+
+---
+
+## Two-agent approach (recommended next iteration): Narrator → Translator
+
+The current prompt-only “self-check” approach can be brittle. Instead, split the system into **two LLM roles**:
+
+1) **Narrator agent (high-level intent)**
+   - Output: a single plain-language next-step command such as:
+     - “Move the cursor a tiny bit to the right toward the Chrome icon.”
+     - “Scroll down slightly to reveal more results.”
+     - “Re-observe to confirm the cursor is positioned over the target before clicking.”
+   - No low-level coordinates, no protocol actions.
+
+2) **Translator agent (low-level compiler)**
+   - Input: the narrator’s single intent sentence + the latest screenshot.
+   - Output: strict `desktop_agent.protocol.Action[]` (via the existing JSON plan schema).
+   - Must be conservative; if it cannot confidently translate, return `actions: []` and explain in `notes`.
+
+**Initial implementation:** use the **same model** for both agents, but keep them as separate prompts and separate calls so they can be tuned independently.
+
+### Tasks
+
+#### Prompts / schemas
+
+- [ ] In `src/desktop_agent/prompts.py`, add two prompts:
+  - `narrator_prompt()`: plain text output, exactly one intent sentence.
+  - `translator_prompt()` (or `compiler_prompt()`): strict JSON output (existing plan schema), includes coordinate system rules.
+- [ ] Ensure the translator prompt explicitly states:
+  - x axis is horizontal, y axis is vertical.
+  - `move_delta` negative values move opposite direction.
+  - “move → re-observe → click” policy.
+
+#### LLM wiring (same model, two calls)
+
+- [ ] In `src/desktop_agent/llm.py`, implement a two-stage call path:
+  - Call narrator with (goal + screenshot) → `intent: str`
+  - Call translator with (intent + screenshot) → `LLMPlan` (strict JSON)
+- [ ] Add logging hooks so the UI/demo can display:
+  - narrator intent
+  - translator actions
+  - validation failures (if any)
+
+#### Planner loop integration
+
+- [ ] In `src/desktop_agent/planner.py`, store and surface both:
+  - narrator intent (for “what we’re doing next”)
+  - translator-produced `high_level` + actions (for executor)
+- [ ] Keep step-mode approvals at the executor boundary (unchanged).
+
+#### Demo script integration
+
+- [ ] Update `scripts/llm_screenshot_demo.py` to use the two-agent flow:
+  - print the narrator intent before showing actions
+  - still require explicit `yes` before executing actions
+  - keep conservative move-only sub-batch behavior before any click
+
+#### Tests
+
+- [ ] Add/update tests in `tests/test_llm.py` covering:
+  - narrator output cleaning (single sentence)
+  - translator JSON parsing/validation
+  - retry behavior per-stage (narrator retry vs translator retry)
+
+#### Config / UX
+
+- [ ] Add config toggles (default ON for experiments):
+  - `DESKTOP_AGENT_TWO_AGENT=1` to enable narrator→translator
+  - later: separate model IDs per stage (optional)
+
+---
