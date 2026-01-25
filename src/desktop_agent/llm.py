@@ -312,35 +312,46 @@ class PlannerLLM:
             else:
                 self._client = OpenAIResponsesClient(api_key=api_key)
 
-    def plan_next(self, *, goal: str, screenshot_png: Optional[bytes] = None) -> LLMPlan:
+    def narrate_intent(self, *, goal: str, screenshot_png: Optional[bytes] = None) -> str:
+        """Narrator agent: produce a plain-language ONE-step intent."""
+
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("goal must be a non-empty string")
 
-        # Fake client doesn't support a dedicated narrator stage; keep behavior stable.
+        # Fake client: just return a harmless intent.
         if isinstance(self._client, FakeLLMClient):
-            inp = _build_openai_input(goal=goal, screenshot_png=screenshot_png)
-            txt = self._client.responses_create(model=self._cfg.model, input=inp)
-            return _parse_plan_json(txt)
+            return "Move the cursor slightly to indicate activity."
 
-        # Stage 1: narrator intent (plain text)
         last_err: Optional[Exception] = None
-        intent: str = ""
         for attempt in range(self._cfg.max_retries + 1):
             try:
-                inp1 = _build_openai_input_narrator(goal=goal, screenshot_png=screenshot_png)
-                txt1 = self._client.responses_create(model=self._cfg.model, input=inp1)
-                intent = _clean_intent_text(txt1)
+                inp = _build_openai_input_narrator(goal=goal, screenshot_png=screenshot_png)
+                txt = self._client.responses_create(model=self._cfg.model, input=inp)
+                intent = _clean_intent_text(txt)
                 if not intent:
                     raise LLMParseError("Narrator returned empty intent")
-                break
+                return intent
             except Exception as e:
                 last_err = e
                 if attempt < self._cfg.max_retries:
                     continue
                 raise LLMError(f"LLM narrator stage failed: {e}") from e
 
-        # Stage 2: compile intent to strict JSON actions
-        last_err = None
+        raise LLMError(f"LLM narrator stage failed: {last_err}")
+
+    def translate_intent(self, *, intent: str, screenshot_png: Optional[bytes] = None) -> LLMPlan:
+        """Translator agent: compile a narrator intent into strict JSON actions."""
+
+        if not isinstance(intent, str) or not intent.strip():
+            raise ValueError("intent must be a non-empty string")
+
+        # Fake client doesn't support staged translation; use canned action plan.
+        if isinstance(self._client, FakeLLMClient):
+            inp = _build_openai_input(goal=intent, screenshot_png=screenshot_png)
+            txt = self._client.responses_create(model=self._cfg.model, input=inp)
+            return _parse_plan_json(txt)
+
+        last_err: Optional[Exception] = None
         for attempt in range(self._cfg.max_retries + 1):
             try:
                 inp2 = _build_openai_input_compiler(intent=intent, screenshot_png=screenshot_png)
@@ -349,18 +360,7 @@ class PlannerLLM:
                     input=inp2,
                     text={"format": {"type": "json_object"}},
                 )
-                plan = _parse_plan_json(txt2)
-
-                # Help observability: ensure the high_level references the intent.
-                if plan.high_level.strip() == "":
-                    plan = LLMPlan(
-                        high_level=intent,
-                        actions=plan.actions,
-                        notes=plan.notes,
-                        self_eval=plan.self_eval,
-                        verification_prompt=plan.verification_prompt,
-                    )
-                return plan
+                return _parse_plan_json(txt2)
             except LLMParseError as e:
                 msg = str(e).lower()
                 if msg.startswith("invalid actions") or "high_level" in msg or "actions" in msg or "notes" in msg:
@@ -373,6 +373,23 @@ class PlannerLLM:
                 last_err = e
                 if attempt < self._cfg.max_retries:
                     continue
-                raise LLMError(f"LLM compiler stage failed: {e}") from e
+                raise LLMError(f"LLM translator stage failed: {e}") from e
 
-        raise LLMError(f"LLM planning failed: {last_err}")
+        raise LLMError(f"LLM translator stage failed: {last_err}")
+
+    def plan_next(self, *, goal: str, screenshot_png: Optional[bytes] = None) -> LLMPlan:
+        """Back-compat: compose narrator+translator using the same underlying model."""
+
+        intent = self.narrate_intent(goal=goal, screenshot_png=screenshot_png)
+        plan = self.translate_intent(intent=intent, screenshot_png=screenshot_png)
+
+        # Prefer translator's structured high_level; fall back to intent.
+        if not plan.high_level.strip():
+            return LLMPlan(
+                high_level=intent,
+                actions=plan.actions,
+                notes=plan.notes,
+                self_eval=plan.self_eval,
+                verification_prompt=plan.verification_prompt,
+            )
+        return plan

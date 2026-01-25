@@ -32,6 +32,50 @@ from desktop_agent.llm import OpenAIResponsesClient
 from desktop_agent.protocol import ProtocolError, validate_actions
 from desktop_agent.prompts import system_prompt
 from desktop_agent.vision import ScreenCapture
+from desktop_agent.prompts import compiler_prompt, narrator_prompt
+
+
+def _build_narrator_input(*, goal: str, screenshot_png: bytes) -> list[dict[str, Any]]:
+    sys_prompt = narrator_prompt()
+
+    b64 = base64.b64encode(screenshot_png).decode("ascii")
+    return [
+        {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": f"Goal: {goal}"},
+                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
+            ],
+        },
+    ]
+
+
+def _build_translator_input(*, intent: str, screenshot_png: bytes) -> list[dict[str, Any]]:
+    sys_prompt = compiler_prompt()
+
+    b64 = base64.b64encode(screenshot_png).decode("ascii")
+    return [
+        {"role": "system", "content": [{"type": "input_text", "text": sys_prompt}]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": f"Intent: {intent}"},
+                {"type": "input_image", "image_url": f"data:image/png;base64,{b64}"},
+            ],
+        },
+    ]
+
+
+def _clean_intent_text(txt: str) -> str:
+    s = (txt or "").strip()
+    if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
+        s = s[1:-1].strip()
+    for line in s.splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return s
 
 
 def _build_input(*, goal: str, screenshot_png: bytes) -> list[dict[str, Any]]:
@@ -64,7 +108,7 @@ def main() -> int:
         )
         return 2
 
-    goal = "open chrome browser only using the mouse move delta"
+    goal = "open chrome browser only using the mouse"
 
     controls = WindowsControls()
     ex = Executor(
@@ -92,11 +136,23 @@ def main() -> int:
         except Exception as e:
             print(f"WARNING: Failed to save screenshot: {e}", file=sys.stderr)
 
-        inp = _build_input(goal=goal, screenshot_png=screenshot_png)
+        # --- Narrator stage (plain text intent) ---
+        narrator_inp = _build_narrator_input(goal=goal, screenshot_png=screenshot_png)
 
-        print(f"Calling model: {cfg.openai_model}")
+        print(f"Calling narrator (model): {cfg.openai_model}")
         client = OpenAIResponsesClient(api_key=api_key)
 
+        narrator_txt = client.responses_create(
+            model=cfg.openai_model,
+            input=narrator_inp,
+        )
+        intent = _clean_intent_text(narrator_txt)
+        print(f"\nNARRATOR INTENT: {intent}\n")
+
+        # --- Translator stage (strict JSON actions) ---
+        inp = _build_translator_input(intent=intent, screenshot_png=screenshot_png)
+
+        print(f"Calling translator (model): {cfg.openai_model}")
         txt = client.responses_create(
             model=cfg.openai_model,
             input=inp,
