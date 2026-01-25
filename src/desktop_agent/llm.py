@@ -41,6 +41,8 @@ class LLMPlan:
     high_level: str
     actions: list[Action]
     notes: str = ""
+    self_eval: dict[str, Any] | None = None
+    verification_prompt: str = ""
 
 
 class LLMError(RuntimeError):
@@ -213,12 +215,36 @@ def _parse_plan_json(text: str) -> LLMPlan:
     if not isinstance(notes, str):
         raise LLMParseError("'notes' must be a string")
 
-    return LLMPlan(high_level=high_level.strip(), actions=actions, notes=notes)
+    self_eval = payload.get("self_eval")
+    if self_eval is not None:
+        if not isinstance(self_eval, dict):
+            raise LLMParseError("'self_eval' must be an object")
+        status = self_eval.get("status")
+        reason = self_eval.get("reason")
+        allowed = {"success", "continue", "retry", "give_up"}
+        if not isinstance(status, str) or status not in allowed:
+            raise LLMParseError("'self_eval.status' must be one of: success/continue/retry/give_up")
+        if not isinstance(reason, str):
+            raise LLMParseError("'self_eval.reason' must be a string")
+
+    verification_prompt = payload.get("verification_prompt", "")
+    if verification_prompt is None:
+        verification_prompt = ""
+    if not isinstance(verification_prompt, str):
+        raise LLMParseError("'verification_prompt' must be a string")
+
+    return LLMPlan(
+        high_level=high_level.strip(),
+        actions=actions,
+        notes=notes,
+        self_eval=self_eval,
+        verification_prompt=verification_prompt.strip(),
+    )
 
 
 @dataclass(frozen=True)
 class LLMConfig:
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5-nano-2025-08-07"
     api_key_env: str = "OPENAI_API_KEY"
     max_retries: int = 2
     # If true, force fake mode regardless of API key.

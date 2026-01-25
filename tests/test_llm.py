@@ -67,3 +67,19 @@ def test_llm_raises_on_invalid_actions() -> None:
     llm = PlannerLLM(client=client)
     with pytest.raises(LLMParseError):
         llm.plan_next(goal="x")
+
+
+def test_parse_plan_accepts_self_eval() -> None:
+    from desktop_agent.llm import _parse_plan_json
+
+    txt = """{
+        \"high_level\": \"Do something\",
+        \"actions\": [{\"op\": \"release_all\"}],
+        \"notes\": \"\",
+        \"self_eval\": {\"status\": \"continue\", \"reason\": \"Need another step\"},
+        \"verification_prompt\": \"Is the target window open?\"
+    }"""
+    plan = _parse_plan_json(txt)
+    assert plan.self_eval is not None
+    assert plan.self_eval["status"] == "continue"
+    assert plan.verification_prompt == "Is the target window open?"

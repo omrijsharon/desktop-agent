@@ -258,13 +258,53 @@ A recommended path is to try **deterministic translation first**, and only add a
 
 ---
 
-## Suggested development order (practical)
+## Planned enhancement: iterative action batches + post-action re-observation + self-evaluation (recommended)
 
-1) `vision.py` (capture + utilities)
-2) `executor.py` (safe execution layer)
-3) `llm.py` (structured planning output)
-4) `planner.py` (loop + state management)
-5) `ui.py` (chat window + thread-safe updates)
-6) `main.py` (wire everything)
+Current single-step demo (`scripts/llm_screenshot_demo.py`) can execute a one-shot action list. In practice, for safety and reliability, the agent should be explicitly instructed and wired to behave conservatively:
 
-This order keeps each next component testable with fakes before integrating the full UI.
+- After **each action** (or small batch), capture a **new screenshot** and plan again.
+- When using the mouse, prefer **move → re-observe → click** (avoid clicking based on a stale image).
+- Add an explicit **self-evaluation** field in the model response so we can see whether it believes the task succeeded, needs more steps, failed-but-wants-to-retry, or failed-and-wants-to-quit.
+
+Important: the self-evaluation data is **for logging/UI only**. The controller/executor must **ignore** it.
+
+### Instruction/prompt updates (LLM behavior)
+
+- [ ] Update `desktop_agent.prompts.system_prompt()` to include a rule like:
+  - “You will receive a new screenshot after actions are executed. When using the mouse: move first, request/expect a new screenshot, and only click when you are confident the cursor is over the intended target.”
+- [ ] Add explicit “small batches only” guidance:
+  - Prefer 1–3 actions per cycle.
+  - Avoid multi-click sequences without intermediate re-observation.
+
+### Response schema updates (self-evaluation)
+
+- [ ] Extend the LLM response schema (planner output) to include e.g.:
+  - `self_eval`: { `status`: "success" | "continue" | "retry" | "give_up", `reason`: string }
+- [ ] Ensure parsing/validation in `desktop_agent.llm` tolerates absence of `self_eval` (backward compatible).
+- [ ] Ensure planner/UI logs `self_eval` but executor/controller do not act on it.
+
+### Loop behavior updates (demo + core planner)
+
+- [ ] Update `scripts/llm_screenshot_demo.py` to run as a mini-loop:
+  - capture screenshot → ask LLM → validate → execute
+  - after **move** actions, always capture a fresh screenshot before any click
+  - exit only when:
+    - the model returns `self_eval.status == "success"`, OR
+    - a max-iterations limit is hit, OR
+    - user aborts / ESC stop
+- [ ] Add “verification step” for the Chrome-open task:
+  - after a click intended to open Chrome, capture a screenshot and ask the model whether Chrome is open.
+  - only exit after the model indicates success (via `self_eval`).
+
+### Safety/UX tasks
+
+- [ ] Keep explicit user confirmation before executing each batch in the demo script.
+- [ ] Add a max loops / max actions cap to prevent runaway behavior.
+- [ ] Document that ESC is the emergency stop and should be used if misbehavior occurs.
+
+### Tests
+
+- [ ] Add unit tests for:
+  - parsing `self_eval` when present/absent
+  - planner loop respecting `self_eval.status` to stop/continue
+  - demo loop logic (can be tested with FakeLLMClient + stub controls)
