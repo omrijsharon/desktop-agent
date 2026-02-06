@@ -1,0 +1,172 @@
+/* Futuristic "Apple-ish" dark glass style (PySide6 / Qt) */
+
+#root {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+    stop:0 rgba(14, 16, 20, 255),
+    stop:1 rgba(9, 10, 14, 255));
+}
+
+#header {
+  background: rgba(255, 255, 255, 12);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 16px;
+}
+
+#title {
+  color: rgba(255, 255, 255, 235);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+#subtitle {
+  color: rgba(255, 255, 255, 150);
+  font-size: 12px;
+}
+
+#model_combo {
+  background: rgba(255, 255, 255, 12);
+  color: rgba(255, 255, 255, 220);
+  border: 1px solid rgba(255, 255, 255, 20);
+  border-radius: 12px;
+  padding: 6px 10px;
+  min-width: 190px;
+  font-size: 12px;
+}
+
+#model_combo QAbstractItemView {
+  background: rgba(20, 22, 28, 245);
+  color: rgba(255, 255, 255, 235);
+  border: 1px solid rgba(255, 255, 255, 20);
+  selection-background-color: rgba(74, 136, 255, 110);
+}
+
+#scroll {
+  background: rgba(255, 255, 255, 8);
+  border: 1px solid rgba(255, 255, 255, 14);
+  border-radius: 18px;
+}
+
+#chat {
+  background: transparent;
+}
+
+#composer {
+  background: rgba(255, 255, 255, 10);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 18px;
+}
+
+#input {
+  background: rgba(0, 0, 0, 0);
+  color: rgba(255, 255, 255, 235);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+
+#status {
+  color: rgba(255, 255, 255, 140);
+  font-size: 11px;
+}
+
+QCheckBox {
+  color: rgba(255, 255, 255, 200);
+}
+
+QCheckBox::indicator {
+  width: 16px;
+  height: 16px;
+}
+
+QCheckBox::indicator:unchecked {
+  border: 1px solid rgba(255, 255, 255, 30);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 8);
+}
+
+QCheckBox::indicator:checked {
+  border: 1px solid rgba(116, 176, 255, 160);
+  border-radius: 4px;
+  background: rgba(74, 136, 255, 180);
+}
+
+#btn_primary {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+    stop:0 rgba(74, 136, 255, 255),
+    stop:1 rgba(140, 92, 255, 255));
+  color: rgba(255, 255, 255, 245);
+  border: 0px;
+  border-radius: 12px;
+  padding: 9px 14px;
+  font-weight: 700;
+}
+
+#btn_primary:disabled {
+  background: rgba(255, 255, 255, 20);
+  color: rgba(255, 255, 255, 120);
+}
+
+#btn_ghost {
+  background: rgba(255, 255, 255, 10);
+  color: rgba(255, 255, 255, 220);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+
+#btn_ghost:hover {
+  background: rgba(255, 255, 255, 14);
+}
+
+QTextBrowser#bubble_text {
+  background: transparent;
+  border: 0px;
+  color: rgba(255, 255, 255, 235);
+  font-size: 13px;
+}
+
+QTextBrowser#bubble_text .msg {
+  line-height: 1.25em;
+}
+
+QFrame#bubble_user {
+  background: rgba(74, 136, 255, 170);
+  border: 1px solid rgba(255, 255, 255, 30);
+  border-radius: 18px;
+}
+
+QFrame#bubble_assistant {
+  background: rgba(255, 255, 255, 12);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 18px;
+}
+
+QFrame#bubble_tool {
+  background: rgba(255, 255, 255, 10);
+  border: 1px dashed rgba(255, 255, 255, 18);
+  border-radius: 18px;
+}
+
+QFrame#bubble_tool QTextBrowser#bubble_text {
+  color: rgba(255, 255, 255, 200);
+  font-family: "SF Mono", "Cascadia Mono", "Consolas", monospace;
+  font-size: 12px;
+}
+
+QDialog#dialog {
+  background: rgba(16, 18, 24, 255);
+}
+
+#dialog_label {
+  color: rgba(255, 255, 255, 210);
+}
+
+#system_edit {
+  background: rgba(255, 255, 255, 8);
+  color: rgba(255, 255, 255, 235);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 14px;
+  padding: 10px 12px;
+  font-size: 12px;
+}

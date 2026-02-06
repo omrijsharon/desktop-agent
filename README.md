@@ -108,3 +108,23 @@ Environment variables:
 - `project.md` – product requirements and architecture notes
 - `short_term_plan.md` – immediate tasks / cleanup checklist
 - `docs/gpt-5-2_prompting_guide.md` – local copy of the OpenAI GPT‑5.2 prompting guide (converted from HTML)
+
+## Experimental: self-extending tools (local dev)
+
+This repo includes an experimental mechanism for letting a model *create and register* a new function tool while an agent loop is already running.
+
+Key files:
+- `src/desktop_agent/tools.py` – tool registry + function-tool runner + tool creation/verification helpers
+- `scripts/self_tooling_demo.py` – minimal demo loop
+
+How it works:
+1) The model calls `create_and_register_python_tool` with a tool schema, Python code, and a few self-tests.
+2) The handler runs a verifier (in a subprocess) and only registers the tool if the tests pass.
+3) Subsequent model calls in the same loop include the new tool in `tools=[...]`.
+
+Run the demo:
+- `python scripts/self_tooling_demo.py "Create a tool that converts Celsius to Fahrenheit and then convert 20C"`
+
+Safety notes:
+- Generated tool code is restricted (imports are allow-listed; some dangerous builtins are blocked).
+- Generated tools run in a subprocess per-call (no auto-import into the main process).

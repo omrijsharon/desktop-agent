@@ -35,3 +35,7 @@ Thumbs.db
 
 # Generated artifacts from demo/preview scripts
 scripts/*.png
+
+# Generated tool code / proposals (runtime artifacts)
+generated_tools/
+tool_proposals/
