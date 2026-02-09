@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import html
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import json
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .chat_session import ChatConfig, ChatSession
+from .chat_store import delete_chat, list_chats, load_chat, new_chat_id, save_chat
 from .config import DEFAULT_MODEL, SUPPORTED_MODELS, load_config
 
 
@@ -57,11 +60,12 @@ class _Signals(QtCore.QObject):
     append_tool = QtCore.Signal(str)
     set_busy = QtCore.Signal(bool)
     set_status = QtCore.Signal(str)
+    set_tokens = QtCore.Signal(str)
 
 
 @dataclass(frozen=True)
 class ChatUIConfig:
-    width: int = 520
+    width: int = 1560
     height: int = 860
 
 
@@ -152,6 +156,13 @@ class Bubble(QtWidgets.QFrame):
         self._label.updateGeometry()
         self.updateGeometry()
 
+    def set_streaming_text(self, text: str) -> None:
+        # Streaming path: avoid re-parsing markdown on every tiny delta.
+        t = text or ""
+        self._label.setHtml(f"<div class='msg'>{_esc(t).replace('\\n', '<br/>')}</div>")
+        self._label.updateGeometry()
+        self.updateGeometry()
+
 
 class ChatWindow(QtWidgets.QMainWindow):
     def __init__(self, *, cfg: Optional[ChatUIConfig] = None) -> None:
@@ -165,12 +176,18 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._signals.append_tool.connect(lambda t: self._append_message(t, kind="tool"))
         self._signals.set_busy.connect(self._set_busy)
         self._signals.set_status.connect(self._set_status)
+        self._signals.set_tokens.connect(self._set_tokens)
 
         self._session = self._make_session()
         self._show_tool_events = True
         self._hide_think = False
         self._workers: set[_Worker] = set()
         self._bubbles: list[Bubble] = []
+        self._title_wrap: Optional[QtWidgets.QWidget] = None
+        self._store_root = _repo_root()
+        self._active_chat_id: str = self._session.chat_id
+        self._switching_chat: bool = False
+        self._active_submodel_id: str | None = None
 
         self._build_ui()
         self._apply_style()
@@ -183,6 +200,8 @@ class ChatWindow(QtWidgets.QMainWindow):
             "Tip: You can ask it to use web search, read files, or even create+register new tools during the chat.",
             kind="tool",
         )
+        self._refresh_chat_list(select_chat_id=self._active_chat_id)
+        self._set_tokens(self._session.usage_ratio_text())
 
     def exec(self) -> int:
         self.show()
@@ -194,10 +213,16 @@ class ChatWindow(QtWidgets.QMainWindow):
         app_cfg = load_config()
         # Chat uses the same env + model defaults as the main app.
         model = os.environ.get("OPENAI_MODEL", app_cfg.openai_model or DEFAULT_MODEL)
+        raw_vs = (os.environ.get("OPENAI_VECTOR_STORE_IDS") or os.environ.get("OPENAI_VECTOR_STORE_ID") or "").strip()
+        vs_ids = [x.strip() for x in raw_vs.split(",") if x.strip()]
         ccfg = ChatConfig(
             model=model,
             enable_web_search=True,
             web_search_context_size="medium",
+            enable_file_search=bool(vs_ids),
+            file_search_vector_store_ids=list(vs_ids),
+            file_search_max_num_results=None,
+            include_file_search_results=False,
             tool_base_dir=_repo_root(),
             temperature=0.7,
             top_p=0.95,
@@ -235,41 +260,125 @@ class ChatWindow(QtWidgets.QMainWindow):
         header.setObjectName("header")
         hl = QtWidgets.QHBoxLayout(header)
         hl.setContentsMargins(14, 12, 14, 12)
+        hl.setSpacing(10)
 
         title = QtWidgets.QLabel("Chat")
         title.setObjectName("title")
-        subtitle = QtWidgets.QLabel("Tools + Web Search + Self-Extending")
+        subtitle = QtWidgets.QLabel("Tools + Web Search")
         subtitle.setObjectName("subtitle")
-        title_box = QtWidgets.QVBoxLayout()
+        title_wrap = QtWidgets.QWidget()
+        title_wrap.setObjectName("title_wrap")
+        title_wrap.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._title_wrap = title_wrap
+        title_box = QtWidgets.QVBoxLayout(title_wrap)
+        title_box.setContentsMargins(0, 0, 0, 0)
         title_box.setSpacing(2)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
-        hl.addLayout(title_box)
+        hl.addWidget(title_wrap, 0)
         hl.addStretch(1)
+
+        # Right-side controls: keep these as a fixed-size cluster so they never overlap.
+        right = QtWidgets.QWidget()
+        right.setObjectName("header_right")
+        right.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Preferred)
+        hr = QtWidgets.QHBoxLayout(right)
+        hr.setContentsMargins(0, 0, 0, 0)
+        hr.setSpacing(8)
 
         self._model_combo = QtWidgets.QComboBox()
         self._model_combo.setObjectName("model_combo")
         self._model_combo.addItems(list(SUPPORTED_MODELS))
+        self._model_combo.setEditable(False)
+        # Keep width bounded; elide long model IDs.
+        self._model_combo.setMinimumContentsLength(18)
+        self._model_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        # Allow shrinking in narrow windows; otherwise Qt may lay out neighbors
+        # as-if the combo was smaller, but the widget will still enforce its
+        # minimum size and overlap them.
+        self._model_combo.setMinimumWidth(0)
+        self._model_combo.setMaximumWidth(240)
         # Try to set current model if present.
         idx = self._model_combo.findText(self._session.cfg.model)
         if idx >= 0:
             self._model_combo.setCurrentIndex(idx)
         self._model_combo.currentTextChanged.connect(self._on_model_changed)
-        hl.addWidget(self._model_combo)
+        hr.addWidget(self._model_combo)
 
-        self._btn_system = QtWidgets.QPushButton("System")
+        self._btn_system = QtWidgets.QPushButton("Sys")
         self._btn_system.setObjectName("btn_ghost")
+        self._btn_system.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._btn_system.setToolTip("System prompt")
+        self._btn_system.setMaximumWidth(64)
         self._btn_system.clicked.connect(self._open_system_dialog)
-        hl.addWidget(self._btn_system)
+        hr.addWidget(self._btn_system)
 
-        self._btn_controls = QtWidgets.QPushButton("Controls")
+        self._btn_controls = QtWidgets.QPushButton("Ctrl")
         self._btn_controls.setObjectName("btn_ghost")
+        self._btn_controls.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._btn_controls.setToolTip("Controls")
+        self._btn_controls.setMaximumWidth(72)
         self._btn_controls.clicked.connect(self._open_controls_dialog)
-        hl.addWidget(self._btn_controls)
+        hr.addWidget(self._btn_controls)
+
+        # Let the model picker take whatever space remains.
+        hr.setStretch(0, 1)
+        hr.setStretch(1, 0)
+        hr.setStretch(2, 0)
+
+        hl.addWidget(right, 0, QtCore.Qt.AlignmentFlag.AlignRight)
 
         outer.addWidget(header)
 
+        # Main area: sidebar + chat
+        main = QtWidgets.QHBoxLayout()
+        main.setSpacing(12)
+        outer.addLayout(main, 1)
+
+        # Sidebar (chat history)
+        sidebar = QtWidgets.QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setMinimumWidth(210)
+        sidebar.setMaximumWidth(300)
+        sbl = QtWidgets.QVBoxLayout(sidebar)
+        sbl.setContentsMargins(12, 12, 12, 12)
+        sbl.setSpacing(10)
+
+        row = QtWidgets.QHBoxLayout()
+        lbl = QtWidgets.QLabel("Chats")
+        lbl.setObjectName("sidebar_title")
+        row.addWidget(lbl)
+        row.addStretch(1)
+        self._btn_new_chat = QtWidgets.QPushButton("New")
+        self._btn_new_chat.setObjectName("btn_ghost")
+        self._btn_new_chat.clicked.connect(self._new_chat)
+        row.addWidget(self._btn_new_chat)
+        sbl.addLayout(row)
+
+        self._chat_list = QtWidgets.QListWidget()
+        self._chat_list.setObjectName("chat_list")
+        self._chat_list.itemSelectionChanged.connect(self._on_chat_selected)
+        sbl.addWidget(self._chat_list, 1)
+
+        side_btns = QtWidgets.QHBoxLayout()
+        self._btn_rename = QtWidgets.QPushButton("Rename")
+        self._btn_rename.setObjectName("btn_ghost")
+        self._btn_rename.clicked.connect(self._rename_chat)
+        self._btn_delete = QtWidgets.QPushButton("Delete")
+        self._btn_delete.setObjectName("btn_ghost")
+        self._btn_delete.clicked.connect(self._delete_chat)
+        side_btns.addWidget(self._btn_rename)
+        side_btns.addWidget(self._btn_delete)
+        sbl.addLayout(side_btns)
+
+        main.addWidget(sidebar, 0)
+
         # Chat area
+        chat_col = QtWidgets.QVBoxLayout()
+        chat_col.setSpacing(12)
+
         self._scroll = QtWidgets.QScrollArea()
         self._scroll.setObjectName("scroll")
         self._scroll.setWidgetResizable(True)
@@ -283,7 +392,17 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._chat_layout.addStretch(1)
 
         self._scroll.setWidget(self._chat)
-        outer.addWidget(self._scroll, 1)
+        chat_col.addWidget(self._scroll, 1)
+
+        # Tokens indicator (bottom-right of chat area)
+        token_row = QtWidgets.QHBoxLayout()
+        token_row.setContentsMargins(0, 0, 0, 0)
+        token_row.addStretch(1)
+        self._tokens = QtWidgets.QLabel("")
+        self._tokens.setObjectName("tokens")
+        self._tokens.setToolTip("Approx prompt tokens used (includes system prompt) / context window")
+        token_row.addWidget(self._tokens)
+        chat_col.addLayout(token_row)
 
         # Composer
         composer = QtWidgets.QFrame()
@@ -324,7 +443,46 @@ class ChatWindow(QtWidgets.QMainWindow):
         right.addStretch(1)
 
         cl.addLayout(right)
-        outer.addWidget(composer)
+        chat_col.addWidget(composer)
+        main.addLayout(chat_col, 1)
+
+        # Right sidebar (submodels)
+        subbar = QtWidgets.QFrame()
+        subbar.setObjectName("subbar")
+        subbar.setMinimumWidth(240)
+        subbar.setMaximumWidth(360)
+        rbl = QtWidgets.QVBoxLayout(subbar)
+        rbl.setContentsMargins(12, 12, 12, 12)
+        rbl.setSpacing(10)
+
+        row2 = QtWidgets.QHBoxLayout()
+        lbl2 = QtWidgets.QLabel("Submodels")
+        lbl2.setObjectName("sidebar_title")
+        row2.addWidget(lbl2)
+        row2.addStretch(1)
+        self._btn_refresh_sub = QtWidgets.QPushButton("Refresh")
+        self._btn_refresh_sub.setObjectName("btn_ghost")
+        self._btn_refresh_sub.clicked.connect(self._refresh_submodel_list)
+        row2.addWidget(self._btn_refresh_sub)
+        rbl.addLayout(row2)
+
+        self._sub_list = QtWidgets.QListWidget()
+        self._sub_list.setObjectName("sub_list")
+        self._sub_list.itemDoubleClicked.connect(lambda _: self._open_selected_submodel())
+        rbl.addWidget(self._sub_list, 1)
+
+        sub_btns = QtWidgets.QHBoxLayout()
+        self._btn_open_sub = QtWidgets.QPushButton("Open")
+        self._btn_open_sub.setObjectName("btn_ghost")
+        self._btn_open_sub.clicked.connect(self._open_selected_submodel)
+        self._btn_close_sub = QtWidgets.QPushButton("Close")
+        self._btn_close_sub.setObjectName("btn_ghost")
+        self._btn_close_sub.clicked.connect(self._close_selected_submodel)
+        sub_btns.addWidget(self._btn_open_sub)
+        sub_btns.addWidget(self._btn_close_sub)
+        rbl.addLayout(sub_btns)
+
+        main.addWidget(subbar, 0)
 
     def _apply_style(self) -> None:
         qss = _load_qss()
@@ -351,6 +509,9 @@ class ChatWindow(QtWidgets.QMainWindow):
     def _set_status(self, text: str) -> None:
         self._status.setText(text)
 
+    def _set_tokens(self, text: str) -> None:
+        self._tokens.setText(text)
+
     def _set_busy(self, busy: bool) -> None:
         self._btn_send.setEnabled(not busy)
         self._input.setEnabled(not busy)
@@ -368,7 +529,7 @@ class ChatWindow(QtWidgets.QMainWindow):
     def _on_model_changed(self, model: str) -> None:
         self._session.cfg.model = str(model)
 
-    def _append_message(self, text: str, *, kind: str) -> None:
+    def _append_message(self, text: str, *, kind: str) -> Bubble:
         bubble = Bubble(text=text, kind=kind)
         self._bubbles.append(bubble)
         container = QtWidgets.QWidget()
@@ -387,9 +548,15 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._chat_layout.insertWidget(self._chat_layout.count() - 1, container)
         QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
         QtCore.QTimer.singleShot(0, self._update_bubble_widths)
+        QtCore.QTimer.singleShot(0, self._refresh_submodel_list)
+        return bubble
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
+        if self._title_wrap is not None:
+            # Keep the title region from starving the right-side controls in narrow windows.
+            max_w = max(140, min(260, int(self.width() * 0.38)))
+            self._title_wrap.setMaximumWidth(max_w)
         self._update_bubble_widths()
 
     def _update_bubble_widths(self) -> None:
@@ -532,17 +699,25 @@ class ChatWindow(QtWidgets.QMainWindow):
         mtc.setRange(0, 50)
         mtc.setValue(int(self._session.cfg.max_tool_calls or 8))
 
+        ctxw = QtWidgets.QSpinBox()
+        ctxw.setRange(1_024, 1_000_000)
+        ctxw.setSingleStep(1024)
+        ctxw.setValue(int(self._session.cfg.context_window_tokens))
+
         gl.addRow("Temperature", temp)
         gl.addRow("Top-p", top_p)
+        gl.addRow("Context window (tok)", ctxw)
         gl.addRow("Max output tokens", mot)
         gl.addRow("Max tool calls", mtc)
 
         def apply_gen() -> None:
             self._session.cfg.temperature = float(temp.value())
             self._session.cfg.top_p = float(top_p.value())
+            self._session.cfg.context_window_tokens = int(ctxw.value())
             self._session.cfg.max_output_tokens = int(mot.value())
             self._session.cfg.max_tool_calls = int(mtc.value())
             self._append_message("Generation settings updated.", kind="tool")
+            self._set_tokens(self._session.usage_ratio_text())
 
         btn_apply_gen = QtWidgets.QPushButton("Apply generation settings")
         btn_apply_gen.setObjectName("btn_primary")
@@ -569,6 +744,37 @@ class ChatWindow(QtWidgets.QMainWindow):
         chk_read = QtWidgets.QCheckBox("Allow read_file")
         chk_read.setChecked(bool(self._session.cfg.allow_read_file))
 
+        chk_file = QtWidgets.QCheckBox("Enable file search (vector stores)")
+        chk_file.setChecked(bool(getattr(self._session.cfg, "enable_file_search", False)))
+
+        vs_edit = QtWidgets.QLineEdit()
+        vs_edit.setObjectName("vector_store_ids")
+        vs_edit.setPlaceholderText("vs_... , vs_... (comma-separated)")
+        try:
+            vs_edit.setText(",".join(getattr(self._session.cfg, "file_search_vector_store_ids", []) or []))
+        except Exception:
+            vs_edit.setText("")
+
+        fs_max = QtWidgets.QSpinBox()
+        fs_max.setRange(0, 50)
+        fs_max.setToolTip("0 = default")
+        cur_mn = getattr(self._session.cfg, "file_search_max_num_results", None)
+        fs_max.setValue(int(cur_mn) if cur_mn is not None else 0)
+
+        chk_fs_results = QtWidgets.QCheckBox("Include file search results (uses more tokens)")
+        chk_fs_results.setChecked(bool(getattr(self._session.cfg, "include_file_search_results", False)))
+
+        chk_write = QtWidgets.QCheckBox("Allow write/append files (memory.md, chat_history/*)")
+        chk_write.setChecked(bool(self._session.cfg.allow_write_files))
+
+        chk_py = QtWidgets.QCheckBox("Allow python sandbox (numpy/pandas/matplotlib)")
+        chk_py.setChecked(bool(getattr(self._session.cfg, "allow_python_sandbox", False)))
+
+        py_timeout = QtWidgets.QDoubleSpinBox()
+        py_timeout.setRange(0.5, 120.0)
+        py_timeout.setSingleStep(0.5)
+        py_timeout.setValue(float(getattr(self._session.cfg, "python_sandbox_timeout_s", 12.0)))
+
         chk_setsys = QtWidgets.QCheckBox("Allow model set_system_prompt")
         chk_setsys.setChecked(bool(self._session.cfg.allow_model_set_system_prompt))
 
@@ -578,21 +784,62 @@ class ChatWindow(QtWidgets.QMainWindow):
         chk_create = QtWidgets.QCheckBox("Allow model create+register tools")
         chk_create.setChecked(bool(self._session.cfg.allow_model_create_tools))
 
+        chk_submodels = QtWidgets.QCheckBox("Allow submodels (spawn/run helper instances)")
+        chk_submodels.setChecked(bool(self._session.cfg.allow_submodels))
+
+        max_sub = QtWidgets.QSpinBox()
+        max_sub.setRange(0, 32)
+        max_sub.setValue(int(self._session.cfg.max_submodels))
+
+        max_depth = QtWidgets.QSpinBox()
+        max_depth.setRange(0, 5)
+        max_depth.setValue(int(self._session.cfg.max_submodel_depth))
+
+        ping_s = QtWidgets.QDoubleSpinBox()
+        ping_s.setRange(0.2, 10.0)
+        ping_s.setSingleStep(0.2)
+        ping_s.setValue(float(self._session.cfg.submodel_ping_s))
+
         tl.addRow(chk_web)
         tl.addRow("Search context size", ctx)
         tl.addRow(chk_read)
+        tl.addRow(chk_file)
+        tl.addRow("Vector store IDs", vs_edit)
+        tl.addRow("File search max results", fs_max)
+        tl.addRow(chk_fs_results)
+        tl.addRow(chk_write)
+        tl.addRow(chk_py)
+        tl.addRow("Python sandbox timeout (s)", py_timeout)
         tl.addRow(chk_setsys)
         tl.addRow(chk_propose)
         tl.addRow(chk_create)
+        tl.addRow(chk_submodels)
+        tl.addRow("Max submodels", max_sub)
+        tl.addRow("Max submodel depth", max_depth)
+        tl.addRow("Ping interval (s)", ping_s)
 
         def apply_tools() -> None:
             self._session.cfg.enable_web_search = bool(chk_web.isChecked())
             self._session.cfg.web_search_context_size = str(ctx.currentText())
             self._session.cfg.allow_read_file = bool(chk_read.isChecked())
+            self._session.cfg.enable_file_search = bool(chk_file.isChecked())
+            raw = str(vs_edit.text() or "").strip()
+            self._session.cfg.file_search_vector_store_ids = [x.strip() for x in raw.split(",") if x.strip()]
+            mn = int(fs_max.value())
+            self._session.cfg.file_search_max_num_results = mn if mn > 0 else None
+            self._session.cfg.include_file_search_results = bool(chk_fs_results.isChecked())
+            self._session.cfg.allow_write_files = bool(chk_write.isChecked())
+            self._session.cfg.allow_python_sandbox = bool(chk_py.isChecked())
+            self._session.cfg.python_sandbox_timeout_s = float(py_timeout.value())
             self._session.cfg.allow_model_set_system_prompt = bool(chk_setsys.isChecked())
             self._session.cfg.allow_model_propose_tools = bool(chk_propose.isChecked())
             self._session.cfg.allow_model_create_tools = bool(chk_create.isChecked())
+            self._session.cfg.allow_submodels = bool(chk_submodels.isChecked())
+            self._session.cfg.max_submodels = int(max_sub.value())
+            self._session.cfg.max_submodel_depth = int(max_depth.value())
+            self._session.cfg.submodel_ping_s = float(ping_s.value())
             self._append_message("Tool settings updated.", kind="tool")
+            self._refresh_submodel_list()
 
         btn_apply_tools = QtWidgets.QPushButton("Apply tool settings")
         btn_apply_tools.setObjectName("btn_primary")
@@ -633,16 +880,309 @@ class ChatWindow(QtWidgets.QMainWindow):
         if not text:
             return
         self._input.clear()
-        self._signals.append_user.emit(text)
 
-        worker = _Worker(session=self._session, text=text, show_tool_events=self._show_tool_events, parent=self)
+        self._append_message(text, kind="user")
+        assistant_bubble: Bubble | None = None
+
+        worker = _Worker(
+            session=self._session,
+            text=text,
+            show_tool_events=self._show_tool_events,
+            hide_think=self._hide_think,
+            parent=self,
+        )
         worker.signals.tool.connect(self._signals.append_tool.emit)
-        worker.signals.assistant.connect(self._signals.append_assistant.emit)
+
+        def on_partial(t: str) -> None:
+            nonlocal assistant_bubble
+            if assistant_bubble is None:
+                assistant_bubble = self._append_message("", kind="assistant")
+            assistant_bubble.set_streaming_text(t if isinstance(t, str) else str(t))
+            QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
+            QtCore.QTimer.singleShot(0, self._update_bubble_widths)
+
+        def on_final(t: str) -> None:
+            nonlocal assistant_bubble
+            if assistant_bubble is None:
+                assistant_bubble = self._append_message("", kind="assistant")
+            assistant_bubble.set_text(t if isinstance(t, str) else str(t))
+            QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
+            QtCore.QTimer.singleShot(0, self._update_bubble_widths)
+
+        worker.signals.assistant_partial.connect(on_partial)
+        worker.signals.assistant_final.connect(on_final)
         worker.signals.busy.connect(self._signals.set_busy.emit)
         worker.signals.error.connect(lambda m: self._signals.append_tool.emit(f"Error: {m}"))
+        worker.signals.tokens.connect(self._signals.set_tokens.emit)
         worker.finished.connect(lambda: self._workers.discard(worker))
+        worker.finished.connect(self._persist_current_chat)
         self._workers.add(worker)
         worker.start()
+
+    # ---- chat history ----
+
+    def _refresh_chat_list(self, *, select_chat_id: str | None = None) -> None:
+        metas = list_chats(self._store_root)
+        self._chat_list.blockSignals(True)
+        try:
+            self._chat_list.clear()
+            for m in metas:
+                item = QtWidgets.QListWidgetItem(m.title)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, m.chat_id)
+                item.setToolTip(f"{m.chat_id}\nUpdated: {m.updated_at}")
+                self._chat_list.addItem(item)
+
+            # Ensure current chat exists on disk.
+            self._persist_current_chat()
+            if select_chat_id:
+                for i in range(self._chat_list.count()):
+                    it = self._chat_list.item(i)
+                    if it.data(QtCore.Qt.ItemDataRole.UserRole) == select_chat_id:
+                        self._chat_list.setCurrentItem(it)
+                        break
+        finally:
+            self._chat_list.blockSignals(False)
+        self._refresh_submodel_list()
+
+    def _persist_current_chat(self) -> None:
+        try:
+            rec = self._session.to_record()
+            save_chat(self._store_root, rec)
+        except Exception:
+            pass
+
+    def _clear_chat_view(self) -> None:
+        self._bubbles.clear()
+        # Remove all widgets except the trailing stretch.
+        while self._chat_layout.count() > 1:
+            it = self._chat_layout.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _load_chat_into_ui(self, chat_id: str) -> None:
+        self._switching_chat = True
+        try:
+            data = load_chat(self._store_root, chat_id)
+            self._session.load_record(data)
+            self._active_chat_id = self._session.chat_id
+
+            # Sync model picker.
+            idx = self._model_combo.findText(self._session.cfg.model)
+            if idx >= 0:
+                self._model_combo.setCurrentIndex(idx)
+
+            self._clear_chat_view()
+
+            # Replay conversation items into bubbles (user/assistant only).
+            for item in self._session.to_record().get("conversation", []):
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                if role in {"user", "assistant"}:
+                    parts = item.get("content") or []
+                    if isinstance(parts, list) and parts:
+                        t = parts[0].get("text")
+                        if isinstance(t, str) and t.strip():
+                            self._append_message(t.strip(), kind="user" if role == "user" else "assistant")
+            self._refresh_submodel_list()
+        finally:
+            self._switching_chat = False
+
+    def _on_chat_selected(self) -> None:
+        if self._switching_chat:
+            return
+        it = self._chat_list.currentItem()
+        if it is None:
+            return
+        chat_id = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(chat_id, str) or not chat_id:
+            return
+        if chat_id == self._active_chat_id:
+            return
+        self._persist_current_chat()
+        self._load_chat_into_ui(chat_id)
+
+    def _new_chat(self) -> None:
+        self._persist_current_chat()
+        self._session.chat_id = new_chat_id()
+        self._session.title = "New chat"
+        self._session.reset(keep_system_prompt=True)
+        self._active_chat_id = self._session.chat_id
+        self._clear_chat_view()
+        self._append_message("New chat created.", kind="tool")
+        self._persist_current_chat()
+        self._refresh_chat_list(select_chat_id=self._active_chat_id)
+        self._refresh_submodel_list()
+
+    def _rename_chat(self) -> None:
+        it = self._chat_list.currentItem()
+        if it is None:
+            return
+        chat_id = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(chat_id, str):
+            return
+        cur = it.text()
+        text, ok = QtWidgets.QInputDialog.getText(self, "Rename chat", "Title:", text=cur)
+        if not ok:
+            return
+        new_title = (text or "").strip()
+        if not new_title:
+            return
+        if chat_id == self._active_chat_id:
+            self._session.title = new_title
+        try:
+            data = load_chat(self._store_root, chat_id)
+            data["title"] = new_title
+            save_chat(self._store_root, data)
+        except Exception:
+            pass
+        self._refresh_chat_list(select_chat_id=self._active_chat_id)
+
+    def _delete_chat(self) -> None:
+        it = self._chat_list.currentItem()
+        if it is None:
+            return
+        chat_id = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(chat_id, str):
+            return
+        if chat_id == self._active_chat_id:
+            # Don't delete the active chat; create a new one instead.
+            self._new_chat()
+        try:
+            delete_chat(self._store_root, chat_id)
+        except Exception:
+            pass
+        self._refresh_chat_list(select_chat_id=self._active_chat_id)
+        self._refresh_submodel_list()
+
+    # ---- submodels UI ----
+
+    def _refresh_submodel_list(self) -> None:
+        try:
+            metas = self._session.list_submodels()
+        except Exception:
+            metas = []
+        self._sub_list.blockSignals(True)
+        try:
+            cur_id = None
+            it = self._sub_list.currentItem()
+            if it is not None:
+                cur_id = it.data(QtCore.Qt.ItemDataRole.UserRole)
+
+            self._sub_list.clear()
+            for m in metas:
+                sid = str(m.get("id") or "")
+                title = str(m.get("title") or sid)
+                model = str(m.get("model") or "")
+                depth = int(m.get("depth", 0))
+                state = str(m.get("state") or "")
+                label = f"{title}"
+                if model:
+                    label += f"\n{model}"
+                meta_bits = []
+                if depth:
+                    meta_bits.append(f"d{depth}")
+                if state:
+                    meta_bits.append(state)
+                if meta_bits:
+                    label += f"  ({', '.join(meta_bits)})"
+                item = QtWidgets.QListWidgetItem(label)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
+                self._sub_list.addItem(item)
+
+            # Restore selection if possible
+            if isinstance(cur_id, str) and cur_id:
+                for i in range(self._sub_list.count()):
+                    it2 = self._sub_list.item(i)
+                    if it2.data(QtCore.Qt.ItemDataRole.UserRole) == cur_id:
+                        self._sub_list.setCurrentItem(it2)
+                        break
+        finally:
+            self._sub_list.blockSignals(False)
+
+    def _selected_submodel_id(self) -> str | None:
+        it = self._sub_list.currentItem()
+        if it is None:
+            return None
+        sid = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        return sid if isinstance(sid, str) and sid else None
+
+    def _open_selected_submodel(self) -> None:
+        sid = self._selected_submodel_id()
+        if not sid:
+            return
+        sm = self._session.get_submodel(sid)
+        if sm is None:
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Submodel • {sm.title}")
+        dlg.setObjectName("dialog")
+        dlg.resize(860, 700)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        header = QtWidgets.QLabel(f"{sm.title} — {sm.model}")
+        header.setObjectName("dialog_label")
+        lay.addWidget(header)
+
+        sys = QtWidgets.QTextEdit()
+        sys.setReadOnly(True)
+        sys.setObjectName("system_edit")
+        sys.setPlainText(sm.system_prompt)
+        sys.setFixedHeight(120)
+        lay.addWidget(sys)
+
+        view = QtWidgets.QTextBrowser()
+        view.setObjectName("bubble_text")
+        view.setOpenExternalLinks(True)
+        view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        view.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAnywhere)
+
+        def render() -> None:
+            parts: list[str] = []
+            for item in sm.transcript:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                if role == "main":
+                    txt = item.get("text")
+                    if isinstance(txt, str):
+                        parts.append(f"### Main → Submodel\n{txt}\n")
+                elif role == "assistant":
+                    txt = item.get("text")
+                    if isinstance(txt, str):
+                        parts.append(f"### Submodel\n{txt}\n")
+                elif role == "tool":
+                    parts.append("### Tool event\n```json\n" + json.dumps(item.get("item"), ensure_ascii=False)[:4000] + "\n```\n")
+                elif role == "error":
+                    txt = item.get("text")
+                    if isinstance(txt, str):
+                        parts.append(f"### Error\n{txt}\n")
+            transcript = "\n".join(parts)
+            if hasattr(view, "setMarkdown"):
+                view.setMarkdown(transcript)
+            else:
+                view.setHtml(f"<pre>{_esc(transcript)}</pre>")
+
+        render()
+        lay.addWidget(view, 1)
+
+        timer = QtCore.QTimer(dlg)
+        timer.setInterval(500)
+        timer.timeout.connect(render)
+        timer.start()
+
+        dlg.exec()
+
+    def _close_selected_submodel(self) -> None:
+        sid = self._selected_submodel_id()
+        if not sid:
+            return
+        self._session.close_submodel(sid)
+        self._refresh_submodel_list()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         # Best-effort shutdown of background threads to avoid "QThread destroyed" warnings.
@@ -661,22 +1201,38 @@ class ChatWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._workers.clear()
+        try:
+            self._session.shutdown()
+        except Exception:
+            pass
+        self._persist_current_chat()
         super().closeEvent(event)
 
 
 class _WorkerSignals(QtCore.QObject):
-    assistant = QtCore.Signal(str)
+    assistant_partial = QtCore.Signal(str)
+    assistant_final = QtCore.Signal(str)
     tool = QtCore.Signal(str)
     error = QtCore.Signal(str)
     busy = QtCore.Signal(bool)
+    tokens = QtCore.Signal(str)
 
 
 class _Worker(QtCore.QThread):
-    def __init__(self, *, session: ChatSession, text: str, show_tool_events: bool, parent: Optional[QtCore.QObject]) -> None:
+    def __init__(
+        self,
+        *,
+        session: ChatSession,
+        text: str,
+        show_tool_events: bool,
+        hide_think: bool,
+        parent: Optional[QtCore.QObject],
+    ) -> None:
         super().__init__(parent)
         self.session = session
         self.text = text
         self.show_tool_events = show_tool_events
+        self.hide_think = hide_think
         self.signals = _WorkerSignals()
 
     def run(self) -> None:  # type: ignore[override]
@@ -684,11 +1240,45 @@ class _Worker(QtCore.QThread):
         try:
             if self.isInterruptionRequested():
                 return
-            delta = self.session.send(self.text)
+            full_raw = ""
+            last_emit = 0.0
+            last_tok_emit = 0.0
+            new_items: list[dict[str, Any]] = []
+            prompt_tok_est = self.session.estimate_prompt_tokens(user_text=self.text)
+            max_ctx = int(getattr(self.session.cfg, "context_window_tokens", 0) or 0)
+
+            for ev in self.session.send_stream(self.text):
+                if self.isInterruptionRequested():
+                    return
+                et = ev.get("type")
+                if et == "assistant_delta":
+                    d = ev.get("delta")
+                    if isinstance(d, str) and d:
+                        full_raw += d
+                    now = time.monotonic()
+                    if now - last_emit >= 0.05:
+                        shown = _strip_think(full_raw) if self.hide_think else full_raw
+                        self.signals.assistant_partial.emit(shown)
+                        last_emit = now
+                    if now - last_tok_emit >= 0.20:
+                        out_tok_est = self.session.estimate_tokens(full_raw)
+                        used_est = int(prompt_tok_est + out_tok_est)
+                        if max_ctx > 0:
+                            pct = (used_est / max_ctx) * 100.0
+                            self.signals.tokens.emit(f"~{used_est:,}/{max_ctx:,} tok ({pct:.1f}%)")
+                        else:
+                            self.signals.tokens.emit(f"~{used_est:,} tok")
+                        last_tok_emit = now
+                elif et == "turn_done":
+                    ni = ev.get("new_items")
+                    if isinstance(ni, list):
+                        new_items = [x for x in ni if isinstance(x, dict)]
+
             if self.isInterruptionRequested():
                 return
+
             if self.show_tool_events:
-                for item in delta.new_items:
+                for item in new_items:
                     t = item.get("type")
                     if t == "function_call":
                         name = item.get("name", "")
@@ -706,7 +1296,6 @@ class _Worker(QtCore.QThread):
                         sources = action.get("sources") or []
                         msg = f"[web_search] query={q!r} sources={len(sources)}"
                         self.signals.tool.emit(msg)
-                        # Emit a short clickable-looking list.
                         shown = 0
                         for s in sources:
                             if not isinstance(s, dict):
@@ -720,10 +1309,25 @@ class _Worker(QtCore.QThread):
                             self.signals.tool.emit(f"  {shown}. {url}{ttxt}")
                             if shown >= 5:
                                 break
-            out = delta.assistant_text.strip()
-            if self.session.cfg.hide_think:
-                out = _strip_think(out)
-            self.signals.assistant.emit(out)
+                    elif t == "file_search_call":
+                        q = item.get("query") or ""
+                        status = item.get("status") or ""
+                        msg = f"[file_search] query={q!r} status={status!r}"
+                        self.signals.tool.emit(msg)
+                        results = item.get("results") or item.get("search_results") or []
+                        if isinstance(results, list) and results:
+                            self.signals.tool.emit(f"  results={len(results)}")
+                            for i, r in enumerate(results[:5], 1):
+                                if not isinstance(r, dict):
+                                    continue
+                                fname = r.get("filename") or r.get("file_name") or ""
+                                score = r.get("score")
+                                if fname:
+                                    self.signals.tool.emit(f"  {i}. {fname} score={score}")
+
+            out = (_strip_think(full_raw) if self.hide_think else full_raw).strip()
+            self.signals.assistant_final.emit(out)
+            self.signals.tokens.emit(self.session.usage_ratio_text())
         except Exception as e:
             self.signals.error.emit(f"{type(e).__name__}: {e}")
         finally:

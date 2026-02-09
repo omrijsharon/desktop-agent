@@ -53,13 +53,16 @@ def _load_dotenv_best_effort() -> None:
 _load_dotenv_best_effort()
 
 # Models exposed in the UI model picker.
+# NOTE: `computer-use-preview-2025-03-11` currently rejects image inputs in this flow,
+# so it is intentionally not the default here.
 SUPPORTED_MODELS: tuple[str, ...] = (
+    "gpt-5.2-2025-12-11",
     "gpt-5.2",
     "gpt-5.2-pro",
     "gpt-5.2-codex",
-    "gpt-5.2-2025-12-11",
     "gpt-5-mini",
     "gpt-5-nano",
+    "computer-use-preview-2025-03-11",
 )
 
 DEFAULT_MODEL: str = "gpt-5.2-2025-12-11"

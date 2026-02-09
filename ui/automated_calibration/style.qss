@@ -1,0 +1,51 @@
+/* Minimal dark "Apple-ish" panel style for the calibration runner */
+
+QWidget#root {
+  background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0b0c0f, stop:1 #12141a);
+  color: #e8eefc;
+  font-size: 10pt;
+}
+
+QFrame#panel {
+  background: rgba(18, 20, 26, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 18px;
+}
+
+QLabel#title {
+  font-size: 18pt;
+  font-weight: 600;
+}
+
+QLabel#subtitle {
+  color: rgba(232, 238, 252, 0.65);
+}
+
+QPushButton#btn_primary {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3b82f6, stop:1 #8b5cf6);
+  color: white;
+  border: none;
+  border-radius: 14px;
+  padding: 10px 14px;
+  font-weight: 600;
+}
+QPushButton#btn_primary:disabled { background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.45); }
+
+QPushButton#btn_ghost {
+  background: rgba(255,255,255,0.06);
+  color: rgba(232, 238, 252, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 10px 14px;
+}
+QPushButton#btn_ghost:hover { background: rgba(255,255,255,0.09); }
+
+QTextEdit#log {
+  background: rgba(10, 12, 16, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 10px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  color: rgba(232, 238, 252, 0.92);
+}
+

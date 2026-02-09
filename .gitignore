@@ -36,6 +36,29 @@ Thumbs.db
 # Generated artifacts from demo/preview scripts
 scripts/*.png
 
+# Evolving sim outputs (generated)
+scripts/evolving/world*/
+scripts/evolving/**/tb/
+scripts/evolving/**/events.jsonl
+scripts/evolving/**/relationship_matrix*.json
+scripts/evolving/**/state.json
+
+# Training run artifacts (generated)
+scripts/training/artifacts/
+scripts/training/*_inbox.md
+scripts/training/*_outbox.md
+scripts/training/*_memory.md
+scripts/training/dataset.jsonl
+
 # Generated tool code / proposals (runtime artifacts)
 generated_tools/
 tool_proposals/
+
+# Local chat sessions (saved by chat UI)
+chat_history/
+
+# Automated calibration (contains Wi-Fi credentials)
+ui/automated_calibration/run_config.json
+
+# Model-generated reusable analysis scripts/tools (local artifacts)
+ui/automated_calibration/analysis_tools/

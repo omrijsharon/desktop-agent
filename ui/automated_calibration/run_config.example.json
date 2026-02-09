@@ -1,0 +1,43 @@
+{
+  "pi_ap": {
+    "ssid": "DRONE_PI_AP",
+    "password": "CHANGE_ME"
+  },
+  "hotspot": {
+    "ssid": "MY_HOTSPOT",
+    "password": "CHANGE_ME"
+  },
+  "pi_ssh": {
+    "user": "omrijsharon",
+    "host": "omrijsharon.local",
+    "fallback_host": "10.42.0.1",
+    "use_x11": true
+  },
+  "remote": {
+    "webapp_cmd": "export PYTHONPATH=\"${PYTHONPATH}:/home/omrijsharon/Documents/repos/ArUco_Chaser/src/\"; python /home/omrijsharon/Documents/repos/ArUco_Chaser/tests/z_ekf_calibration_webapp/app.py",
+    "logs_dir": "~/Documents/repos/ArUco_Chaser/tests/z_ekf_calibration_webapp/logs"
+  },
+  "local": {
+    "logs_dir": "C:/Users/tamipinhasi/Documents/repos/ArUco_Chaser/tests/z_ekf_calibration_webapp/logs",
+    "archive_root": "C:/Users/tamipinhasi/Documents/repos/ArUco_Chaser/tests/z_ekf_calibration_webapp/logs_runs"
+  },
+  "analysis": {
+    "analysis_base_dir": "C:/Users/tamipinhasi/Documents/repos/ArUco_Chaser",
+    "model": "gpt-5.2-2025-12-11",
+    "system_prompt": "You are an expert controls and estimation engineer. Your job is to analyze EKF/PID calibration logs and suggest parameter changes with clear reasoning.",
+    "debug_mapping": [
+      "0: aWorldZ*100 (centi m/s²)",
+      "1: zMeas",
+      "2: z",
+      "3: v",
+      "4: sqrt(R_eff)",
+      "5: innov",
+      "6: limit",
+      "7: gate state"
+    ],
+    "betaflight_snippet": "",
+    "control_params": {},
+    "files": [],
+    "extra_context": ""
+  }
+}

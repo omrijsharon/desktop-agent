@@ -29,7 +29,8 @@
   border: 1px solid rgba(255, 255, 255, 20);
   border-radius: 12px;
   padding: 6px 10px;
-  min-width: 190px;
+  min-width: 0px;
+  max-width: 240px;
   font-size: 12px;
 }
 
@@ -44,6 +45,58 @@
   background: rgba(255, 255, 255, 8);
   border: 1px solid rgba(255, 255, 255, 14);
   border-radius: 18px;
+}
+
+#sidebar {
+  background: rgba(255, 255, 255, 8);
+  border: 1px solid rgba(255, 255, 255, 14);
+  border-radius: 18px;
+}
+
+#subbar {
+  background: rgba(255, 255, 255, 8);
+  border: 1px solid rgba(255, 255, 255, 14);
+  border-radius: 18px;
+}
+
+#sidebar_title {
+  color: rgba(255, 255, 255, 210);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#chat_list {
+  background: rgba(0, 0, 0, 0);
+  color: rgba(255, 255, 255, 220);
+  border: 1px solid rgba(255, 255, 255, 14);
+  border-radius: 14px;
+  padding: 6px;
+}
+
+#sub_list {
+  background: rgba(0, 0, 0, 0);
+  color: rgba(255, 255, 255, 220);
+  border: 1px solid rgba(255, 255, 255, 14);
+  border-radius: 14px;
+  padding: 6px;
+}
+
+#sub_list::item {
+  padding: 8px 10px;
+  border-radius: 12px;
+}
+
+#sub_list::item:selected {
+  background: rgba(140, 92, 255, 120);
+}
+
+#chat_list::item {
+  padding: 8px 10px;
+  border-radius: 12px;
+}
+
+#chat_list::item:selected {
+  background: rgba(74, 136, 255, 130);
 }
 
 #chat {
@@ -68,6 +121,12 @@
 #status {
   color: rgba(255, 255, 255, 140);
   font-size: 11px;
+}
+
+#tokens {
+  color: rgba(255, 255, 255, 140);
+  font-size: 11px;
+  padding-right: 6px;
 }
 
 QCheckBox {
@@ -112,7 +171,8 @@ QCheckBox::indicator:checked {
   color: rgba(255, 255, 255, 220);
   border: 1px solid rgba(255, 255, 255, 18);
   border-radius: 12px;
-  padding: 8px 12px;
+  padding: 5px 9px;
+  font-size: 12px;
 }
 
 #btn_ghost:hover {

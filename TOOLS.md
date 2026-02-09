@@ -46,10 +46,22 @@ In `src/desktop_agent/tools.py`:
   - Spec: `read_file_tool_spec()`
   - Handler factory: `make_read_file_handler(base_dir=...)`
   - Safety: restricted to the configured base directory (by default, repo root / CWD) and capped by `max_lines` + `max_chars`.
+- `write_file` / `append_file`:
+  - Specs: `write_file_tool_spec()`, `append_file_tool_spec()`
+  - Handler factories: `make_write_file_handler(...)`, `make_append_file_handler(...)`
+  - Safety: repo-scoped + allow-listed paths (defaults include `memory.md` and `chat_history/*`), and content size limits.
 - `set_system_prompt`:
   - Spec: `set_system_prompt_tool_spec()`
   - Handler factory: `make_set_system_prompt_handler(...)`
   - Purpose: lets the model update the live system prompt for future turns without resetting the conversation by default.
+- `get_system_prompt`:
+  - Spec: `get_system_prompt_tool_spec()`
+  - Handler factory: `make_get_system_prompt_handler(...)`
+  - Purpose: lets the model retrieve the current system prompt.
+- `add_to_system_prompt`:
+  - Spec: `add_to_system_prompt_tool_spec()`
+  - Handler factory: `make_add_to_system_prompt_handler(...)`
+  - Purpose: appends text to the system prompt instead of replacing it.
 
 ### “Self-extending tools” (model creates a new tool)
 
@@ -79,6 +91,42 @@ Important safety design choice:
 ### Built-in web search
 
 The OpenAI `web_search` tool is a built-in tool type. When enabled, you include it in the `tools=[...]` list (no local handler required). The platform runs the search and provides results back to the model as tool output items.
+
+### Built-in file search (vector stores)
+
+The OpenAI `file_search` tool is also a built-in tool type. When enabled, it is included in the `tools=[...]` list with your `vector_store_ids`. The platform performs retrieval against those stores and provides results back to the model as tool output items.
+
+Optional: you can request the tool to include results payloads in the response by setting `include=["file_search_call.results"]` on the Responses API call (this can increase token usage).
+
+### Local python sandbox (data analysis)
+
+This repo also ships a local function tool:
+
+- `python_sandbox`: runs user-provided Python in a subprocess using the current venv (so `numpy`, `pandas`, `matplotlib` work if installed).
+
+Safety notes (best-effort, not bulletproof):
+- Static validation blocks obvious dangerous imports/calls (e.g. `os`, `subprocess`, `socket`, `eval`, `exec`).
+- Runtime guards restrict file access to a per-run sandbox directory under `python_sandbox_runs/`.
+- Use the UI Controls to enable/disable it and set a timeout.
+
+### Reusable analysis tools (python sandbox scripts)
+
+In the calibration analysis window, the model can create reusable tools via:
+
+- `create_and_register_analysis_tool`
+
+This writes the script under `ui/automated_calibration/analysis_tools/<tool_name>/<timestamp>/` and registers a new function tool named `<tool_name>`. When called, that tool runs the saved script inside `python_sandbox` (so it can use numpy/pandas/matplotlib) and passes your provided JSON as `args`.
+
+## Submodels (parallel helper instances)
+
+In the chat UI, the main model can spawn "submodels" via function tools:
+- `submodel_batch`: create/reuse submodels and run tasks (optionally in parallel)
+- `submodel_list`: list active submodels
+- `submodel_close`: terminate a submodel
+
+Implementation detail:
+- Submodels run in a separate Python process (`desktop_agent.submodel_worker`) and communicate over a local IPC channel.
+- The main process sends periodic `ping` messages (configurable in Controls).
 
 ## Demo
 

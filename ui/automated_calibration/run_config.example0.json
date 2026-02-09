@@ -1,0 +1,43 @@
+{
+  "pi_ap": {
+    "ssid": "PI_AP_SSID_HERE",
+    "password": "PI_AP_PASSWORD_HERE"
+  },
+  "hotspot": {
+    "ssid": "HOTSPOT_SSID_HERE",
+    "password": "HOTSPOT_PASSWORD_HERE"
+  },
+  "pi_ssh": {
+    "user": "PI_USERNAME",
+    "host": "pi-hostname.local",
+    "fallback_host": "10.42.0.1",
+    "use_x11": true
+  },
+  "remote": {
+    "webapp_cmd": "export PYTHONPATH=\"${PYTHONPATH}:/home/USER/path/to/repo/src/\"; python /home/USER/path/to/repo/tests/z_ekf_calibration_webapp/app.py",
+    "logs_dir": "~/path/to/logs"
+  },
+  "local": {
+    "logs_dir": "C:/path/to/local/logs",
+    "archive_root": "C:/path/to/local/logs_runs"
+  },
+  "analysis": {
+    "analysis_base_dir": "C:/path/to/your/project",
+    "model": "gpt-5.2-2025-12-11",
+    "system_prompt": "You are an expert controls and estimation engineer. Analyze EKF/PID calibration logs and suggest parameter changes with reasoning.",
+    "debug_mapping": [
+      "0: aWorldZ*100 (centi m/s²)",
+      "1: zMeas",
+      "2: z",
+      "3: v",
+      "4: sqrt(R_eff)",
+      "5: innov",
+      "6: limit",
+      "7: gate state"
+    ],
+    "betaflight_snippet": "",
+    "control_params": {},
+    "files": [],
+    "extra_context": ""
+  }
+}

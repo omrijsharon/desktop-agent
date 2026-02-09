@@ -1,0 +1,59 @@
+{
+  "agents_n": 12,
+  "models": {
+    "narrator": "gpt-5.2-2025-12-11",
+    "agent": "gpt-5-nano"
+  },
+  "day": {
+    "steps_per_day": 12
+  },
+  "night": {
+    "context_reset": true,
+    "morning_reread_memory": true
+  },
+  "life": {
+    "start_age_days": 0,
+    "reproduction_age_days": 7,
+    "max_age_days": 200
+  },
+  "reproduction": {
+    "consent_required": true,
+    "max_children_per_pair": 3,
+    "inheritance": {
+      "mode": "crossover",
+      "mutation_rate": 0.05
+    },
+    "child": {
+      "becomes_agent_immediately": true,
+      "dependency_days": 7,
+      "allowed_ops": [
+        "talk",
+        "self_talk",
+        "rest",
+        "eat",
+        "ask_parent_help",
+        "write_memory",
+        "edit_instructions"
+      ]
+    }
+  },
+  "relationships": {
+    "cooperative_delta": 1.0,
+    "competitive_delta": -1.0,
+    "matrix_path": "relationship_matrix.json",
+    "backup_path": "relationship_matrix.backup.json"
+  },
+  "limits": {
+    "max_instruction_chars": 4000,
+    "max_memory_chars": 12000,
+    "max_edits_per_day": 2,
+    "max_instruction_history_chars": 40000
+  },
+  "selection": {
+    "fitness": {
+      "survival_weight": 1.0,
+      "offspring_reached_repro_weight": 10.0
+    },
+    "mutation_rate": 0.05
+  }
+}

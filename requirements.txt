@@ -3,6 +3,7 @@ mss
 pillow
 openai>=1.0.0
 PySide6>=6.6
+tensorboard>=2.12
 
 # Add runtime dependencies here as they are introduced.
 # Example (later):

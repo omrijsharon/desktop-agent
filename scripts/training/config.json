@@ -1,0 +1,20 @@
+{
+  "sweet_spot_pct": 50.0,
+  "std_pct": 10.0,
+  "solver_count": 10,
+  "max_partners_total": 6,
+  "max_partners_per_solver": 1,
+  "riddle_style": "math",
+  "episodes": 50,
+  "sleep_seconds_between_episodes": 0.0,
+  "status_every_solvers": 0,
+  "stream_grade_each_solver": false,
+  "dataset_filename": "dataset.jsonl",
+  "models": {
+    "riddler": "gpt-5.2-2025-12-11",
+    "actor": "gpt-5.2-2025-12-11",
+    "solver": "gpt-5.2-2025-12-11",
+    "partner": "gpt-5.2-2025-12-11",
+    "critic": "gpt-5.2-2025-12-11"
+  }
+}

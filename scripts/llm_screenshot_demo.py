@@ -23,12 +23,13 @@ import base64
 import json
 import os
 import sys
+import time
 from typing import Any
 
 from desktop_agent.config import load_config
 from desktop_agent.controller import WindowsControls
 from desktop_agent.executor import Executor, ExecutorConfig
-from desktop_agent.llm import OpenAIResponsesClient
+from desktop_agent.llm import OpenAIResponsesClient, PlannerLLM, LLMConfig
 from desktop_agent.protocol import ProtocolError, validate_actions
 from desktop_agent.prompts import system_prompt
 from desktop_agent.vision import ScreenCapture
@@ -95,7 +96,7 @@ def main() -> int:
         )
         return 2
 
-    goal = "open chrome browser only using the mouse"
+    goal = "minimize the vscode window only using the mouse and move delta action commands"
 
     controls = WindowsControls()
     ex = Executor(
@@ -104,6 +105,13 @@ def main() -> int:
     )
 
     max_iters = int(os.environ.get("LLM_DEMO_MAX_ITERS", "12"))
+
+    # Use PlannerLLM so we exercise the narrator↔translator refinement loop in core code.
+    client = OpenAIResponsesClient(api_key=api_key)
+    llm = PlannerLLM(
+        client=client,
+        config=LLMConfig(model=cfg.openai_model),
+    )
 
     for it in range(1, max_iters + 1):
         print(f"\n=== ITERATION {it}/{max_iters} ===\n")
@@ -123,61 +131,34 @@ def main() -> int:
         except Exception as e:
             print(f"WARNING: Failed to save screenshot: {e}", file=sys.stderr)
 
-        # --- Narrator stage (plain text intent) ---
-        narrator_inp = _build_narrator_input(goal=goal, screenshot_png=screenshot_png)
+        print(f"Calling planner (model): {cfg.openai_model}")
+        plan = llm.plan_next(goal=goal, screenshot_png=screenshot_png)
 
-        print(f"Calling narrator (model): {cfg.openai_model}")
-        client = OpenAIResponsesClient(api_key=api_key)
+        print("\n--- PLAN (structured) ---\n")
+        print(f"high_level: {plan.high_level}")
+        if plan.notes:
+            print(f"notes: {plan.notes}")
+        if isinstance(plan.self_eval, dict):
+            print(f"self_eval: {plan.self_eval}")
+        if isinstance(plan.verification_prompt, str) and plan.verification_prompt.strip():
+            print(f"verification_prompt: {plan.verification_prompt.strip()}")
 
-        narrator_txt = client.responses_create(
-            model=cfg.openai_model,
-            input=narrator_inp,
-        )
-        intent = _clean_intent_text(narrator_txt)
-        print(f"\nNARRATOR INTENT: {intent}\n")
-
-        # --- Translator stage (strict JSON actions) ---
-        inp = _build_translator_input(intent=intent)
-
-        print(f"Calling translator (model): {cfg.openai_model}")
-        txt = client.responses_create(
-            model=cfg.openai_model,
-            input=inp,
-            # Ask for strict JSON.
-            text={"format": {"type": "json_object"}},
-        )
-
-        print("\n--- RAW MODEL OUTPUT ---\n")
-        print(txt)
-        print("\n--- END ---\n")
-
-        # Parse + validate
+        # Validate (defense in depth) and inspect status.
         try:
-            payload = json.loads(txt)
-        except json.JSONDecodeError as e:
-            print(f"ERROR: Model output was not valid JSON: {e}", file=sys.stderr)
-            return 3
-
-        self_eval = payload.get("self_eval")
-        if isinstance(self_eval, dict):
-            print(f"self_eval: {self_eval}")
-            status = self_eval.get("status")
-            if status == "success":
-                print("Model reports success. Exiting.")
-                break
-            if status == "give_up":
-                print("Model reports give_up. Exiting.")
-                break
-
-        verification_prompt = payload.get("verification_prompt", "")
-        if isinstance(verification_prompt, str) and verification_prompt.strip():
-            print(f"verification_prompt: {verification_prompt.strip()}")
-
-        try:
-            actions = validate_actions(payload.get("actions"))
+            actions = validate_actions(plan.actions)
         except ProtocolError as e:
             print(f"ERROR: Invalid actions: {e}", file=sys.stderr)
             return 4
+
+        status = None
+        if isinstance(plan.self_eval, dict):
+            status = plan.self_eval.get("status")
+        if status == "success":
+            print("Model reports success. Exiting.")
+            break
+        if status == "give_up":
+            print("Model reports give_up. Exiting.")
+            break
 
         if not actions:
             print("No actions returned; continuing to next iteration.")
@@ -193,13 +174,10 @@ def main() -> int:
             return 0
 
         # Conservative policy: if a batch contains a click, ensure we re-observe after any move.
-        # Simplest approach: if there is any move before a click, execute only up to the first move,
-        # then loop again (new screenshot) before allowing clicks.
         click_idx = next((i for i, a in enumerate(actions) if a["op"] in {"click", "mouse_down", "mouse_up"}), None)
         if click_idx is not None:
             move_before_click = any(a["op"] in {"move", "move_delta"} for a in actions[:click_idx])
             if move_before_click:
-                # execute moves only, then re-observe
                 exec_actions = [a for a in actions[:click_idx] if a["op"] in {"move", "move_delta"}]
                 if exec_actions:
                     print("\nExecuting MOVE-only sub-batch, then re-observing before click...\n")
@@ -210,6 +188,7 @@ def main() -> int:
                             controls.release_all()
                         except Exception:
                             pass
+                    time.sleep(0.5)
                     continue
 
         print("\nExecuting... (press ESC for emergency stop)\n")
@@ -221,7 +200,8 @@ def main() -> int:
             except Exception:
                 pass
 
-        # Note: we intentionally do NOT auto-open the screenshot file.
+        # Give the desktop a moment to update so the next screenshot reflects the executed input.
+        time.sleep(0.5)
 
     print("Done.")
     return 0
