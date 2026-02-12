@@ -73,7 +73,7 @@
   padding: 6px;
 }
 
-#sub_list {
+#agents_tree {
   background: rgba(0, 0, 0, 0);
   color: rgba(255, 255, 255, 220);
   border: 1px solid rgba(255, 255, 255, 14);
@@ -81,14 +81,15 @@
   padding: 6px;
 }
 
-#sub_list::item {
+#agents_tree::item {
   padding: 8px 10px;
   border-radius: 12px;
 }
 
-#sub_list::item:selected {
+#agents_tree::item:selected {
   background: rgba(140, 92, 255, 120);
 }
+
 
 #chat_list::item {
   padding: 8px 10px;

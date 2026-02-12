@@ -201,7 +201,16 @@ class ChatWindow(QtWidgets.QMainWindow):
             kind="tool",
         )
         self._refresh_chat_list(select_chat_id=self._active_chat_id)
+        self._refresh_submodel_list()
         self._set_tokens(self._session.usage_ratio_text())
+
+        # Keep the Agents tree fresh without requiring manual refresh.
+        # If we miss an event (e.g. a tool spawned/closed a sub-agent), this timer
+        # will reconcile within ~1s.
+        self._agents_refresh_timer = QtCore.QTimer(self)
+        self._agents_refresh_timer.setInterval(1000)
+        self._agents_refresh_timer.timeout.connect(self._refresh_submodel_list)
+        self._agents_refresh_timer.start()
 
     def exec(self) -> int:
         self.show()
@@ -446,7 +455,7 @@ class ChatWindow(QtWidgets.QMainWindow):
         chat_col.addWidget(composer)
         main.addLayout(chat_col, 1)
 
-        # Right sidebar (submodels)
+        # Right sidebar (agents tree: main + sub-agents/submodels)
         subbar = QtWidgets.QFrame()
         subbar.setObjectName("subbar")
         subbar.setMinimumWidth(240)
@@ -456,7 +465,7 @@ class ChatWindow(QtWidgets.QMainWindow):
         rbl.setSpacing(10)
 
         row2 = QtWidgets.QHBoxLayout()
-        lbl2 = QtWidgets.QLabel("Submodels")
+        lbl2 = QtWidgets.QLabel("Agents")
         lbl2.setObjectName("sidebar_title")
         row2.addWidget(lbl2)
         row2.addStretch(1)
@@ -466,10 +475,36 @@ class ChatWindow(QtWidgets.QMainWindow):
         row2.addWidget(self._btn_refresh_sub)
         rbl.addLayout(row2)
 
-        self._sub_list = QtWidgets.QListWidget()
-        self._sub_list.setObjectName("sub_list")
-        self._sub_list.itemDoubleClicked.connect(lambda _: self._open_selected_submodel())
-        rbl.addWidget(self._sub_list, 1)
+        self._agents_tree = QtWidgets.QTreeWidget()
+        self._agents_tree.setObjectName("agents_tree")
+        self._agents_tree.setHeaderHidden(True)
+        # We'll render our own +/- icons in a dedicated column for consistent UX across platforms.
+        self._agents_tree.setRootIsDecorated(False)
+        self._agents_tree.setAnimated(True)
+        self._agents_tree.setIndentation(18)
+        self._agents_tree.setColumnCount(2)
+        try:
+            self._agents_tree.header().setStretchLastSection(True)
+            self._agents_tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Fixed)
+            self._agents_tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        except Exception:
+            pass
+        self._agents_tree.setColumnWidth(0, 22)
+        self._agents_tree.setIconSize(QtCore.QSize(14, 14))
+        self._agent_icon_closed: QtGui.QIcon | None = None
+        self._agent_icon_open: QtGui.QIcon | None = None
+        try:
+            icons_dir = _repo_root() / "ui" / "chat" / "icons"
+            self._agent_icon_closed = QtGui.QIcon(str((icons_dir / "branch_closed.svg").resolve()))
+            self._agent_icon_open = QtGui.QIcon(str((icons_dir / "branch_open.svg").resolve()))
+        except Exception:
+            self._agent_icon_closed = None
+            self._agent_icon_open = None
+        self._agents_tree.itemDoubleClicked.connect(lambda *_: self._open_selected_submodel())
+        self._agents_tree.itemExpanded.connect(self._update_agents_tree_labels)
+        self._agents_tree.itemCollapsed.connect(self._update_agents_tree_labels)
+        self._agents_tree.itemClicked.connect(self._on_agents_tree_clicked)
+        rbl.addWidget(self._agents_tree, 1)
 
         sub_btns = QtWidgets.QHBoxLayout()
         self._btn_open_sub = QtWidgets.QPushButton("Open")
@@ -1063,14 +1098,39 @@ class ChatWindow(QtWidgets.QMainWindow):
             metas = self._session.list_submodels()
         except Exception:
             metas = []
-        self._sub_list.blockSignals(True)
-        try:
-            cur_id = None
-            it = self._sub_list.currentItem()
-            if it is not None:
-                cur_id = it.data(QtCore.Qt.ItemDataRole.UserRole)
 
-            self._sub_list.clear()
+        # Tree structure: Main agent (expand/collapse like a folder) -> submodels.
+        self._agents_tree.blockSignals(True)
+        try:
+            prev_expanded: bool | None = None
+            if self._agents_tree.topLevelItemCount() > 0:
+                try:
+                    prev_expanded = bool(self._agents_tree.topLevelItem(0).isExpanded())
+                except Exception:
+                    prev_expanded = None
+
+            cur_id: str | None = None
+            it = self._agents_tree.currentItem()
+            if it is not None:
+                data = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict) and data.get("kind") == "submodel":
+                    sid = data.get("id")
+                    cur_id = str(sid) if isinstance(sid, str) and sid else None
+
+            self._agents_tree.clear()
+
+            # Main "folder"
+            main_label = "Main"
+            try:
+                mm = str(getattr(self._session.cfg, "model", "") or "")
+                if mm:
+                    main_label += f"\n{mm}"
+            except Exception:
+                pass
+            main_item = QtWidgets.QTreeWidgetItem(["", main_label])
+            main_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"kind": "main"})
+            self._agents_tree.addTopLevelItem(main_item)
+
             for m in metas:
                 sid = str(m.get("id") or "")
                 title = str(m.get("title") or sid)
@@ -1087,25 +1147,74 @@ class ChatWindow(QtWidgets.QMainWindow):
                     meta_bits.append(state)
                 if meta_bits:
                     label += f"  ({', '.join(meta_bits)})"
-                item = QtWidgets.QListWidgetItem(label)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, sid)
-                self._sub_list.addItem(item)
+                child = QtWidgets.QTreeWidgetItem(["", label])
+                child.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"kind": "submodel", "id": sid})
+                main_item.addChild(child)
+
+            if prev_expanded is None:
+                main_item.setExpanded(True)
+            else:
+                main_item.setExpanded(bool(prev_expanded))
+            self._update_agents_tree_labels()
 
             # Restore selection if possible
             if isinstance(cur_id, str) and cur_id:
-                for i in range(self._sub_list.count()):
-                    it2 = self._sub_list.item(i)
-                    if it2.data(QtCore.Qt.ItemDataRole.UserRole) == cur_id:
-                        self._sub_list.setCurrentItem(it2)
+                for i in range(main_item.childCount()):
+                    it2 = main_item.child(i)
+                    d = it2.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                    if isinstance(d, dict) and d.get("kind") == "submodel" and d.get("id") == cur_id:
+                        self._agents_tree.setCurrentItem(it2)
                         break
         finally:
-            self._sub_list.blockSignals(False)
+            self._agents_tree.blockSignals(False)
+
+    def _update_agents_tree_labels(self) -> None:
+        """Keep the Main label updated (model name may change)."""
+
+        try:
+            top = self._agents_tree.topLevelItem(0)
+        except Exception:
+            top = None
+        if top is None:
+            return
+        try:
+            base = "Main"
+            mm = str(getattr(self._session.cfg, "model", "") or "")
+            if mm:
+                base += f"\n{mm}"
+        except Exception:
+            base = "Main"
+        top.setText(1, base)
+        if top.childCount() > 0:
+            icon = self._agent_icon_open if bool(top.isExpanded()) else self._agent_icon_closed
+            if icon is not None:
+                top.setIcon(0, icon)
+        else:
+            top.setIcon(0, QtGui.QIcon())
+
+    def _on_agents_tree_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
+        # Clicking the icon column toggles expand/collapse like a file explorer.
+        try:
+            if int(column) != 0:
+                return
+        except Exception:
+            return
+        if item is None or item.childCount() <= 0:
+            return
+        if item.isExpanded():
+            item.setExpanded(False)
+        else:
+            item.setExpanded(True)
+        self._update_agents_tree_labels()
 
     def _selected_submodel_id(self) -> str | None:
-        it = self._sub_list.currentItem()
+        it = self._agents_tree.currentItem()
         if it is None:
             return None
-        sid = it.data(QtCore.Qt.ItemDataRole.UserRole)
+        data = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict) or data.get("kind") != "submodel":
+            return None
+        sid = data.get("id")
         return sid if isinstance(sid, str) and sid else None
 
     def _open_selected_submodel(self) -> None:
@@ -1186,6 +1295,10 @@ class ChatWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         # Best-effort shutdown of background threads to avoid "QThread destroyed" warnings.
+        try:
+            self._agents_refresh_timer.stop()
+        except Exception:
+            pass
         for w in list(self._workers):
             try:
                 w.requestInterruption()
