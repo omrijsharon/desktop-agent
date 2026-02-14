@@ -9,10 +9,11 @@ from typing import Any, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .automated_calibration_config import load_run_config, save_run_config
+from .automated_calibration_config import build_analysis_system_prompt, load_run_config, save_run_config
 from .chat_session import ChatConfig, ChatSession
 from .config import DEFAULT_MODEL, load_config
 from .chat_ui import Bubble, _strip_think  # reuse bubble rendering
+from .tools import list_saved_analysis_tool_names
 
 
 JsonDict = dict[str, Any]
@@ -48,32 +49,42 @@ class _Worker(QtCore.QThread):
             max_ctx = int(getattr(self.session.cfg, "context_window_tokens", 0) or 0)
 
             new_items: list[JsonDict] = []
-            for ev in self.session.send_stream(self.text):
-                if self.isInterruptionRequested():
-                    return
-                et = ev.get("type")
-                if et == "assistant_delta":
-                    d = ev.get("delta")
-                    if isinstance(d, str) and d:
-                        full_raw += d
-                    now = time.monotonic()
-                    if now - last_emit >= 0.05:
-                        shown = _strip_think(full_raw) if self.hide_think else full_raw
-                        self.signals.assistant_partial.emit(shown)
-                        last_emit = now
-                    if now - last_tok >= 0.20:
-                        out_tok_est = self.session.estimate_tokens(full_raw)
-                        used_est = int(prompt_tok_est + out_tok_est)
-                        if max_ctx > 0:
-                            pct = (used_est / max_ctx) * 100.0
-                            self.signals.tokens.emit(f"~{used_est:,}/{max_ctx:,} tok ({pct:.1f}%)")
-                        else:
-                            self.signals.tokens.emit(f"~{used_est:,} tok")
-                        last_tok = now
-                elif et == "turn_done":
-                    ni = ev.get("new_items")
-                    if isinstance(ni, list):
-                        new_items = [x for x in ni if isinstance(x, dict)]
+            try:
+                for ev in self.session.send_stream(self.text):
+                    if self.isInterruptionRequested():
+                        return
+                    et = ev.get("type")
+                    if et == "assistant_delta":
+                        d = ev.get("delta")
+                        if isinstance(d, str) and d:
+                            full_raw += d
+                        now = time.monotonic()
+                        if now - last_emit >= 0.05:
+                            shown = _strip_think(full_raw) if self.hide_think else full_raw
+                            self.signals.assistant_partial.emit(shown)
+                            last_emit = now
+                        if now - last_tok >= 0.20:
+                            out_tok_est = self.session.estimate_tokens(full_raw)
+                            used_est = int(prompt_tok_est + out_tok_est)
+                            if max_ctx > 0:
+                                pct = (used_est / max_ctx) * 100.0
+                                self.signals.tokens.emit(f"~{used_est:,}/{max_ctx:,} tok ({pct:.1f}%)")
+                            else:
+                                self.signals.tokens.emit(f"~{used_est:,} tok")
+                            last_tok = now
+                    elif et == "error":
+                        err = ev.get("error")
+                        err_s = str(err) if err is not None else "unknown error"
+                        self.signals.assistant_final.emit(f"[error] {err_s}")
+                        return
+                    elif et == "turn_done":
+                        ni = ev.get("new_items")
+                        if isinstance(ni, list):
+                            new_items = [x for x in ni if isinstance(x, dict)]
+            except Exception as e:  # noqa: BLE001
+                # Last-resort guard: don't crash the QThread override (prints scary tracebacks).
+                self.signals.assistant_final.emit(f"[error] {type(e).__name__}: {e}")
+                return
 
             # Emit tool events after completion (keeps UI simpler).
             for item in new_items:
@@ -84,6 +95,17 @@ class _Worker(QtCore.QThread):
                     self.signals.tool.emit(f"[tool call] {name}({args})")
                 elif t == "function_call_output":
                     out = item.get("output", "")
+                    try:
+                        if isinstance(out, str) and out.strip().startswith("{"):
+                            d = json.loads(out)
+                            if isinstance(d, dict):
+                                imgs = d.get("image_paths")
+                                if isinstance(imgs, list):
+                                    for p in imgs[:8]:
+                                        if isinstance(p, str) and p.strip():
+                                            self.signals.tool.emit(f"[[image:{p.strip()}]]")
+                    except Exception:
+                        pass
                     out_s = out if isinstance(out, str) else str(out)
                     if len(out_s) > 1200:
                         out_s = out_s[:1200] + " …"
@@ -131,6 +153,7 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
             raise RuntimeError("OPENAI_API_KEY is not set")
 
         base_dir = Path(self._cfg.analysis.analysis_base_dir).resolve()
+        saved_tools = list_saved_analysis_tool_names(scripts_root=_repo_root() / "ui" / "automated_calibration" / "analysis_tools")
         ccfg = ChatConfig(
             model=(self._cfg.analysis.model or DEFAULT_MODEL),
             enable_web_search=True,
@@ -141,7 +164,7 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
             allow_write_files=False,
             allow_model_set_system_prompt=False,
             allow_model_propose_tools=False,
-            allow_model_create_tools=False,
+            allow_model_create_tools=True,
             allow_python_sandbox=True,
             python_sandbox_timeout_s=20.0,
             allow_model_create_analysis_tools=True,
@@ -149,7 +172,7 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
             allow_submodels=False,
         )
         s = ChatSession(api_key=api_key, config=ccfg)
-        s.set_system_prompt(self._cfg.analysis.system_prompt)
+        s.set_system_prompt(build_analysis_system_prompt(cfg=self._cfg.analysis, saved_analysis_tools=saved_tools))
         return s
 
     def _ensure_session(self) -> ChatSession:
@@ -443,7 +466,8 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
             # Reload strongly typed config
             self._cfg = load_run_config(self._run_config_path)
             if self._session is not None:
-                self._session.set_system_prompt(sys_prompt)
+                saved_tools = list_saved_analysis_tool_names(scripts_root=_repo_root() / "ui" / "automated_calibration" / "analysis_tools")
+                self._session.set_system_prompt(build_analysis_system_prompt(cfg=self._cfg.analysis, saved_analysis_tools=saved_tools))
             self._tool_message("Saved run_config.json and updated system prompt.")
             dlg.accept()
 
@@ -518,10 +542,7 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
         worker.start()
 
     def _send_analysis_prompt(self) -> None:
-        # Builds a deterministic "do the analysis now" prompt.
-        debug = list(self._cfg.analysis.debug_mapping or [])
-        ctrl = self._cfg.analysis.control_params or {}
-        bf_snip = (self._cfg.analysis.betaflight_snippet or "").strip()
+        # Send only file paths; analysis instructions live in the system prompt.
         files = [self._file_list.item(i).text() for i in range(self._file_list.count())]
         if not files:
             self._tool_message("No files selected.")
@@ -538,26 +559,7 @@ class CalibrationAnalysisWindow(QtWidgets.QMainWindow):
                 # Keep as-is; python_sandbox can only copy within base_dir.
                 rels.append(f)
 
-        bf_block = f"\n\nBetaflight snippet:\n{bf_snip}\n" if bf_snip else ""
-        msg = (
-            "Analyze these EKF/PID calibration logs.\n\n"
-            "Debug value mapping:\n"
-            + "\n".join(debug)
-            + "\n\n"
-            "Control parameters / gains (JSON):\n"
-            + json.dumps(ctrl, indent=2, ensure_ascii=False)
-            + bf_block
-            + "\n\n"
-            "Files (repo-relative if possible):\n"
-            + "\n".join(f"- {p}" for p in rels)
-            + "\n\n"
-            "Instructions:\n"
-            "1) Call python_sandbox and use copy_from_repo with the list above (directories allowed) or copy_globs to bring the logs into the sandbox.\n"
-            "2) Parse jsonl, compute innovation stats, gating %, limit hits, and produce plots.\n"
-            "3) Recommend concrete EKF/PID parameter tweaks with reasoning.\n"
-            "4) If you need additional Betaflight code, ask for specific files/functions.\n"
-            "5) If you create a reusable analysis script, register it as a callable tool for future runs.\n"
-        )
+        msg = "Files to analyze (repo-relative if possible):\n" + "\n".join(f"- {p}" for p in rels) + "\n"
         self._input.setPlainText(msg)
         self._on_send()
 

@@ -34,3 +34,31 @@ def test_load_run_config_smoke(tmp_path: Path) -> None:
     assert cfg.pi_ap.ssid == "PI"
     assert cfg.hotspot.ssid == "HS"
     assert cfg.remote.logs_dir == "~/logs"
+
+
+def test_save_run_config_escapes_betaflight_snippet_newlines(tmp_path: Path) -> None:
+    from desktop_agent.automated_calibration_config import load_run_config, save_run_config  # noqa: WPS433
+
+    path = tmp_path / "run_config.json"
+    data = {
+        "pi_ap": {"ssid": "PI", "password": "pw"},
+        "hotspot": {"ssid": "HS", "password": "pw"},
+        "pi_ssh": {"user": "u", "host": "h", "fallback_host": "10.0.0.1", "use_x11": False},
+        "remote": {"webapp_cmd": "echo hi", "logs_dir": "~/logs"},
+        "local": {"logs_dir": "C:/tmp/logs", "archive_root": "C:/tmp/archive"},
+        "analysis": {
+            "analysis_base_dir": "C:/tmp",
+            "model": "gpt-5.2",
+            "system_prompt": "x",
+            "debug_mapping": ["0: a"],
+            "betaflight_snippet": "line1\nline2\n",
+            "control_params": {},
+            "files": [],
+            "extra_context": "",
+        },
+    }
+    save_run_config(path, data)
+    raw = path.read_text(encoding="utf-8")
+    assert "line1\\\\nline2\\\\n" in raw
+    cfg = load_run_config(path)
+    assert cfg.analysis.betaflight_snippet == "line1\nline2\n"

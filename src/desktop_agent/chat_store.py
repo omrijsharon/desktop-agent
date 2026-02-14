@@ -93,3 +93,60 @@ def delete_chat(root: Path, chat_id: str) -> None:
     if p.exists():
         p.unlink()
 
+
+def _chat_has_meaningful_conversation(rec: JsonDict) -> bool:
+    # If an agent crew exists for this chat (even with no messages yet), keep it.
+    agents_state = rec.get("agents_state")
+    if isinstance(agents_state, dict):
+        friends = agents_state.get("friends")
+        if isinstance(friends, list) and len(friends) > 0:
+            return True
+    agents_cfg = rec.get("agents_config")
+    if isinstance(agents_cfg, dict):
+        friends = agents_cfg.get("friends")
+        if isinstance(friends, list) and len(friends) > 0:
+            return True
+
+    conv = rec.get("conversation")
+    if not isinstance(conv, list) or not conv:
+        return False
+    for item in conv:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = item.get("content")
+        if not isinstance(content, list) or not content:
+            continue
+        part0 = content[0] if isinstance(content[0], dict) else None
+        t = part0.get("text") if isinstance(part0, dict) else None
+        if isinstance(t, str) and t.strip():
+            return True
+    return False
+
+
+def prune_empty_chats(root: Path, *, keep_chat_id: str | None = None) -> int:
+    """Delete saved chats that contain no meaningful user/assistant messages.
+
+    Returns the number of deleted chat files.
+    """
+
+    d = ensure_store_dir(root)
+    deleted = 0
+    for p in d.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            cid = str(data.get("chat_id") or p.stem)
+            if keep_chat_id and cid == keep_chat_id:
+                continue
+            if _chat_has_meaningful_conversation(data):
+                continue
+            p.unlink(missing_ok=True)  # type: ignore[call-arg]  # py<3.8 compat not needed, but safe
+            deleted += 1
+        except Exception:
+            continue
+    return deleted
+

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import threading
+import webbrowser
 from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .automated_calibration_config import default_run_config_path, example_run_config_path, load_run_config
+from .automated_calibration_config import build_analysis_system_prompt, default_run_config_path, example_run_config_path, load_run_config
 from .automated_calibration_ops import (
     archive_dir,
     connect_wifi_windows,
@@ -198,7 +199,26 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
     def _pick_ssh_host(self) -> str:
         return self._cfg.pi_ssh.host or self._cfg.pi_ssh.fallback_host
 
+    def _open_webapp_url(self) -> None:
+        url = "http://10.42.0.1:5000/"
+        try:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+            return
+        except Exception:
+            pass
+        try:
+            webbrowser.open(url, new=2)
+        except Exception:
+            pass
+
     def _on_start_webapp(self) -> None:
+        # Open the web UI immediately for a smooth workflow; the page will load once the
+        # Pi webapp is up (or show a connection error if it's not reachable yet).
+        try:
+            self._open_webapp_url()
+        except Exception:
+            pass
+
         def work() -> None:
             if self._webapp_proc is not None and self._webapp_proc.poll() is None:
                 self._log("Webapp already running.")
@@ -412,12 +432,7 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
         if not logs_dir.exists():
             raise RuntimeError(f"logs_dir not found: {logs_dir}")
 
-        # Build initial context: system prompt + debug mapping + optional BF code.
-        debug = "\n".join(self._cfg.analysis.debug_mapping or [])
-        bf_snip = (self._cfg.analysis.betaflight_snippet or "").strip()
-
-        extra = (self._cfg.analysis.extra_context or "").strip()
-        ctrl = self._cfg.analysis.control_params or {}
+        # Analysis instructions live in the system prompt; user message includes only file paths.
 
         ccfg = ChatConfig(
             model=(self._cfg.analysis.model or DEFAULT_MODEL),
@@ -429,14 +444,14 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
             allow_write_files=False,
             allow_model_set_system_prompt=False,
             allow_model_propose_tools=False,
-            allow_model_create_tools=False,
+            allow_model_create_tools=True,
             allow_python_sandbox=True,
             python_sandbox_timeout_s=20.0,
             hide_think=True,
             allow_submodels=False,
         )
         session = ChatSession(api_key=api_key, config=ccfg)
-        session.set_system_prompt(self._cfg.analysis.system_prompt)
+        session.set_system_prompt(build_analysis_system_prompt(cfg=self._cfg.analysis))
 
         # Provide a repo-relative path so python_sandbox can `copy_from_repo`.
         try:
@@ -445,21 +460,7 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
         except Exception:
             rel_logs_s = logs_dir.as_posix()
 
-        msg = (
-            "You are analyzing EKF/PID calibration logs from a drone.\n\n"
-            f"Debug value mapping:\n{debug}\n\n"
-            f"Logs folder (prefer using python_sandbox with copy_from_repo):\n{rel_logs_s}\n\n"
-            f"Control parameters/gains (JSON):\n{json.dumps(ctrl, indent=2, ensure_ascii=False)}\n\n"
-            "Task:\n"
-            "1) Use python_sandbox to parse the jsonl logs, compute key metrics (innovation stats, gating %, limit hits, bias/drift), "
-            "and generate a few plots (time series + histograms).\n"
-            "2) Based on the results, recommend EKF/PID parameter tweaks with concrete values/ranges and reasoning.\n"
-            "3) If you need additional Betaflight code beyond what you have, ask specifically what file/function/section you need.\n"
-        )
-        if extra:
-            msg += f"\nExtra context:\n{extra}\n"
-        if bf_snip:
-            msg += "\nRelevant Betaflight snippet:\n" + bf_snip[:20000] + "\n"
+        msg = f"Files/logs folder to analyze (repo-relative if possible):\n- {rel_logs_s}\n"
 
         delta = session.send(msg)
         out = (delta.assistant_text or "").strip()

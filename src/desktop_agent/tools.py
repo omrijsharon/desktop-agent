@@ -32,6 +32,67 @@ JsonDict = dict[str, Any]
 FunctionHandler = Callable[[JsonDict], str]
 
 
+def _drop_unsupported_param_from_error(e: Exception, create_kwargs: dict[str, Any]) -> str | None:
+    """If OpenAI returns 'Unsupported parameter', drop it and return the param name."""
+
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            param = err.get("param")
+            msg = err.get("message")
+            if isinstance(param, str) and param in create_kwargs and isinstance(msg, str) and "Unsupported parameter" in msg:
+                create_kwargs.pop(param, None)
+                return param
+
+    # Fallback: string-match on common error shapes.
+    msg = str(e)
+    if "Unsupported parameter" in msg:
+        for p in list(create_kwargs.keys()):
+            if f"'{p}'" in msg or f"\"{p}\"" in msg:
+                create_kwargs.pop(p, None)
+                return p
+    return None
+
+
+def _strip_status_field_from_input_items(items: list[JsonDict]) -> list[JsonDict]:
+    """Sanitize input items before echoing them back into `responses.create(input=...)`.
+
+    - Some SDK outputs include a top-level `status` field; the Responses API rejects it.
+    - Some models return `reasoning` items; those must not be replayed as input (they're
+      output-only and can cause 400s when echoed back).
+    - Some message items can carry references to missing reasoning items (e.g. `reasoning`
+      / `reasoning_id`). If we strip reasoning items, we must also strip those references,
+      otherwise the API can reject the input due to missing required items.
+    """
+
+    def deep_pop(obj: Any, *, keys: set[str]) -> Any:
+        if isinstance(obj, dict):
+            d = {}
+            for k, v in obj.items():
+                if k in keys:
+                    continue
+                d[k] = deep_pop(v, keys=keys)
+            return d
+        if isinstance(obj, list):
+            return [deep_pop(x, keys=keys) for x in obj]
+        return obj
+
+    out: list[JsonDict] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("type") in {"reasoning", "reasoning_summary"}:
+            continue
+        if isinstance(it, dict):
+            # Remove unsupported fields and reasoning references (top-level and nested).
+            d = dict(it)
+            d.pop("status", None)
+            d = deep_pop(d, keys={"reasoning", "reasoning_id"})
+            out.append(d)
+        else:
+            out.append(it)  # type: ignore[arg-type]
+    return out
+
+
 class ToolError(RuntimeError):
     pass
 
@@ -207,6 +268,7 @@ def run_responses_with_function_tools(
     instructions: Optional[str] = None,
     instructions_provider: Optional[Callable[[], Optional[str]]] = None,
     on_item: Optional[Callable[[JsonDict], None]] = None,
+    on_unsupported_param: Optional[Callable[[str], None]] = None,
     max_rounds: int = 8,
     return_input_items: bool = False,
     **create_kwargs: Any,
@@ -230,6 +292,7 @@ def run_responses_with_function_tools(
         if tools is None or handlers is None:
             raise ToolError("Provide either (tools, handlers) or registry")
     input_list = list(input_items)
+    cw = dict(create_kwargs)
 
     for _ in range(max_rounds):
         if registry is not None:
@@ -239,13 +302,30 @@ def run_responses_with_function_tools(
         round_handlers = registry.handlers if registry is not None else (handlers or {})
 
         cur_instructions = instructions_provider() if instructions_provider is not None else instructions
-        resp = client.responses.create(
-            model=model,
-            input=input_list,
-            tools=list(round_tools),
-            instructions=cur_instructions,
-            **create_kwargs,
-        )
+        last_err: Exception | None = None
+        for _drop_try in range(8):
+            try:
+                resp = client.responses.create(
+                    model=model,
+                    input=_strip_status_field_from_input_items(input_list),
+                    tools=list(round_tools),
+                    instructions=cur_instructions,
+                    **cw,
+                )
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                dropped = _drop_unsupported_param_from_error(e, cw)
+                if dropped is None:
+                    raise
+                if on_unsupported_param is not None:
+                    try:
+                        on_unsupported_param(dropped)
+                    except Exception:
+                        pass
+        if last_err is not None:
+            raise last_err
 
         output = getattr(resp, "output", None)
         if not isinstance(output, list):
@@ -334,6 +414,7 @@ def run_responses_with_function_tools_stream(
     instructions_provider: Optional[Callable[[], Optional[str]]] = None,
     on_item: Optional[Callable[[JsonDict], None]] = None,
     on_text_delta: Optional[Callable[[str], None]] = None,
+    on_unsupported_param: Optional[Callable[[str], None]] = None,
     max_rounds: int = 8,
     return_input_items: bool = False,
     **create_kwargs: Any,
@@ -352,6 +433,7 @@ def run_responses_with_function_tools_stream(
         raise ToolError("Provide either (tools, handlers) or registry")
 
     input_list = list(input_items)
+    cw = dict(create_kwargs)
     last_resp: Any = None
 
     for _ in range(max_rounds):
@@ -363,47 +445,74 @@ def run_responses_with_function_tools_stream(
 
         cur_instructions = instructions_provider() if instructions_provider is not None else instructions
 
-        stream = client.responses.create(
-            model=model,
-            input=input_list,
-            tools=list(round_tools),
-            instructions=cur_instructions,
-            stream=True,
-            **create_kwargs,
-        )
-
         completed_resp: Any = None
-
-        for evt in stream:
-            ed = _as_event_dict(evt)
-            etype = str(ed.get("type") or "")
-
-            # Best-effort text streaming: handle common delta shapes.
-            delta = ed.get("delta")
-            if isinstance(delta, str) and ("output_text" in etype or etype.endswith(".delta") or "text" in etype):
-                if on_text_delta is not None:
+        for _drop_try in range(8):
+            yielded_any = False
+            completed_resp = None
+            # Create the stream (may raise immediately).
+            try:
+                stream = client.responses.create(
+                    model=model,
+                    input=_strip_status_field_from_input_items(input_list),
+                    tools=list(round_tools),
+                    instructions=cur_instructions,
+                    stream=True,
+                    **cw,
+                )
+            except Exception as e:  # noqa: BLE001
+                dropped = _drop_unsupported_param_from_error(e, cw)
+                if dropped is None:
+                    raise
+                if on_unsupported_param is not None:
                     try:
-                        on_text_delta(delta)
+                        on_unsupported_param(dropped)
                     except Exception:
                         pass
-                yield {"type": "text_delta", "delta": delta}
+                continue
 
-            # Completed response is usually embedded in the event.
-            if "response" in ed and isinstance(ed.get("response"), dict):
-                # Some events include the response payload repeatedly; take the latest.
-                if etype.endswith("completed") or etype.endswith("done") or etype.endswith("response.completed"):
-                    completed_resp = ed["response"]
-                else:
-                    completed_resp = ed["response"]
+            try:
+                for evt in stream:
+                    ed = _as_event_dict(evt)
+                    etype = str(ed.get("type") or "")
 
-            # Some SDKs use `response` attribute, but not exposed in dict.
-            if completed_resp is None and hasattr(evt, "response"):
-                try:
-                    r = getattr(evt, "response")
-                    if r is not None:
-                        completed_resp = r
-                except Exception:
-                    pass
+                    # Best-effort text streaming: handle common delta shapes.
+                    delta = ed.get("delta")
+                    if isinstance(delta, str) and ("output_text" in etype or etype.endswith(".delta") or "text" in etype):
+                        yielded_any = True
+                        if on_text_delta is not None:
+                            try:
+                                on_text_delta(delta)
+                            except Exception:
+                                pass
+                        yield {"type": "text_delta", "delta": delta}
+
+                    # Completed response is usually embedded in the event.
+                    if "response" in ed and isinstance(ed.get("response"), dict):
+                        # Some events include the response payload repeatedly; take the latest.
+                        if etype.endswith("completed") or etype.endswith("done") or etype.endswith("response.completed"):
+                            completed_resp = ed["response"]
+                        else:
+                            completed_resp = ed["response"]
+
+                    # Some SDKs use `response` attribute, but not exposed in dict.
+                    if completed_resp is None and hasattr(evt, "response"):
+                        try:
+                            r = getattr(evt, "response")
+                            if r is not None:
+                                completed_resp = r
+                        except Exception:
+                            pass
+                break
+            except Exception as e:  # noqa: BLE001
+                dropped = _drop_unsupported_param_from_error(e, cw)
+                if dropped is None or yielded_any:
+                    raise
+                if on_unsupported_param is not None:
+                    try:
+                        on_unsupported_param(dropped)
+                    except Exception:
+                        pass
+                continue
 
         # Fallback: if stream didn't surface a response object, try to use the last event.
         resp = completed_resp if completed_resp is not None else last_resp
@@ -779,6 +888,141 @@ def python_sandbox_tool_spec() -> JsonDict:
     }
 
 
+def render_plot_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "render_plot",
+        "description": (
+            "Run Python (via python_sandbox) to generate plots/graphs and return paths to created image files. "
+            "Save figures using matplotlib (Agg) to PNG/SVG inside the sandbox; the UI can display them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Python code to execute; should save one or more image files."},
+                "copy_from_repo": {"type": "array", "items": {"type": "string"}},
+                "copy_globs": {"type": "array", "items": {"type": "string"}},
+                "timeout_s": {"type": "number"},
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def create_peer_agent_tool_spec() -> JsonDict:
+    """Tool spec for creating a same-level peer agent in the Chat UI.
+
+    Note: this tool is UI-owned (it requires an AgentHub). The handler is expected
+    to enforce additional gating (e.g., only allow if the user explicitly asked).
+    """
+
+    return {
+        "type": "function",
+        "name": "create_peer_agent",
+        "description": (
+            "Create a new same-level peer agent (friend) in the current chat session. "
+            "Use only when the user explicitly asked you to create/generate a new agent."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Unique display name for the new agent."},
+                "model": {"type": "string", "description": "Model id for the agent, e.g. gpt-4.1-mini."},
+                "system_prompt": {"type": "string", "description": "System prompt for the new agent."},
+                "memory_path": {
+                    "type": ["string", "null"],
+                    "description": "Optional repo-relative path to a memory markdown file.",
+                },
+            },
+            "required": ["name", "model", "system_prompt"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def make_create_peer_agent_handler(
+    *,
+    is_armed: Callable[[], bool],
+    disarm: Callable[[], None],
+    create_peer: Callable[[str, str, str, Optional[str]], JsonDict],
+) -> FunctionHandler:
+    """Create handler for `create_peer_agent` with UI-defined callbacks.
+
+    Args:
+        is_armed: Returns True if the user explicitly requested agent creation.
+        disarm: Called after a successful creation attempt (best-effort).
+        create_peer: Callback that actually creates the agent and returns a JSON-ish dict.
+    """
+
+    def _handler(args: JsonDict) -> str:
+        if not is_armed():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "create_peer_agent is gated. Ask the user to explicitly say "
+                        "'generate agent' or 'create an agent' in chat before calling this tool."
+                    ),
+                }
+            )
+
+        name = args.get("name")
+        model = args.get("model")
+        system_prompt = args.get("system_prompt")
+        memory_path = args.get("memory_path", None)
+
+        if not isinstance(name, str) or not name.strip():
+            raise ToolError("name must be a non-empty string")
+        if not isinstance(model, str) or not model.strip():
+            raise ToolError("model must be a non-empty string")
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise ToolError("system_prompt must be a non-empty string")
+        if memory_path is not None and not isinstance(memory_path, str):
+            raise ToolError("memory_path must be a string or null")
+
+        try:
+            out = create_peer(name.strip(), model.strip(), system_prompt.strip(), memory_path.strip() if isinstance(memory_path, str) else None)
+        finally:
+            # Always disarm after an attempt so the user must explicitly re-request.
+            try:
+                disarm()
+            except Exception:
+                pass
+
+        return json.dumps({"ok": True, **(out or {})})
+
+    return _handler
+
+
+def make_render_plot_handler(*, python_sandbox_handler: FunctionHandler) -> FunctionHandler:
+    """Thin wrapper around python_sandbox that highlights image outputs."""
+
+    def handler(args: JsonDict) -> str:
+        payload: JsonDict = {"code": args.get("code")}
+        for k in ("copy_from_repo", "copy_globs", "timeout_s"):
+            v = args.get(k)
+            if v is not None:
+                payload[k] = v
+
+        out_s = python_sandbox_handler(payload)
+        try:
+            d = json.loads(out_s)
+        except Exception:
+            return out_s
+        if not isinstance(d, dict):
+            return out_s
+
+        imgs = d.get("image_paths")
+        if not isinstance(imgs, list):
+            imgs = []
+        d2 = dict(d)
+        d2["image_paths"] = [x for x in imgs if isinstance(x, str) and x.strip()][:20]
+        return json.dumps(d2, ensure_ascii=False)
+
+    return handler
+
+
 _PY_SANDBOX_BANNED_IMPORTS: set[str] = {
     "asyncio",
     "ctypes",
@@ -885,13 +1129,15 @@ import io
 import os
 import pathlib
 import runpy
+import sys
 
 ROOT = pathlib.Path(os.environ["PY_SANDBOX_ROOT"]).resolve()
 USER = ROOT / "user_code.py"
+ALLOW_ABS = [pathlib.Path(p).resolve() for p in os.environ.get("PY_SANDBOX_ALLOW_ABS_PREFIXES", "").split(os.pathsep) if p]
 
 _orig_open = builtins.open
 
-def _resolve(p):
+def _resolve_write(p):
     p = pathlib.Path(p)
     if p.is_absolute():
         raise PermissionError("absolute paths are not allowed")
@@ -900,8 +1146,26 @@ def _resolve(p):
         raise PermissionError("path escapes sandbox")
     return rp
 
+def _resolve_read(p):
+    p = pathlib.Path(p)
+    if p.is_absolute():
+        rp = p.resolve()
+        for ap in ALLOW_ABS:
+            try:
+                if str(rp).startswith(str(ap)):
+                    return rp
+            except Exception:
+                pass
+        raise PermissionError("absolute paths are not allowed")
+    rp = (ROOT / p).resolve()
+    if not str(rp).startswith(str(ROOT)):
+        raise PermissionError("path escapes sandbox")
+    return rp
+
 def safe_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
-    rp = _resolve(file)
+    m = str(mode or "r")
+    is_write = any(x in m for x in ("w", "a", "+", "x"))
+    rp = _resolve_write(file) if is_write else _resolve_read(file)
     return _orig_open(rp, mode, buffering, encoding=encoding, errors=errors, newline=newline, closefd=closefd, opener=opener)
 
 builtins.open = safe_open
@@ -923,14 +1187,14 @@ _orig_rmdir = _os.rmdir
 
 def _wrap1(fn):
     def inner(p, *a, **k):
-        rp = _resolve(p)
+        rp = _resolve_write(p)
         return fn(str(rp), *a, **k)
     return inner
 
 def _wrap2(fn):
     def inner(p1, p2, *a, **k):
-        rp1 = _resolve(p1)
-        rp2 = _resolve(p2)
+        rp1 = _resolve_write(p1)
+        rp2 = _resolve_write(p2)
         return fn(str(rp1), str(rp2), *a, **k)
     return inner
 
@@ -1085,6 +1349,10 @@ runpy.run_path(str(USER), run_name="__main__")
 
         env = os.environ.copy()
         env["PY_SANDBOX_ROOT"] = str(run_dir)
+        # Allow read-only imports/resources from the running interpreter's environment (venv + stdlib).
+        # Writes are still restricted to the sandbox directory.
+        allow_abs = [str(Path(sys.prefix).resolve()), str(Path(sys.base_prefix).resolve())]
+        env["PY_SANDBOX_ALLOW_ABS_PREFIXES"] = os.pathsep.join(dict.fromkeys(allow_abs))
         env.setdefault("MPLBACKEND", "Agg")
 
         try:
@@ -1125,6 +1393,17 @@ runpy.run_path(str(USER), run_name="__main__")
         except Exception:
             pass
 
+        image_exts = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
+        image_paths: list[str] = []
+        try:
+            run_dir_rel = str(run_dir.relative_to(root)).replace("\\", "/")
+            for relp in created_files:
+                if isinstance(relp, str) and relp.lower().endswith(image_exts):
+                    image_paths.append(f"{run_dir_rel}/{relp}".replace("\\", "/"))
+        except Exception:
+            pass
+        image_paths = image_paths[:20]
+
         return json.dumps(
             {
                 "ok": True,
@@ -1137,6 +1416,7 @@ runpy.run_path(str(USER), run_name="__main__")
                 "stdout": cap(stdout),
                 "stderr": cap(stderr),
                 "created_files": created_files[:200],
+                "image_paths": image_paths,
             }
         )
 
@@ -1239,10 +1519,137 @@ def make_create_and_register_analysis_tool_handler(
                     payload[k] = v
             return python_sandbox_handler(payload)
 
-        registry.add(tool_spec=tool_spec, handler=run_tool)
+        # Analysis tools are meant to be iterated on; allow overwriting an existing tool_name
+        # within the same session (e.g., after loading saved tools at startup).
+        registry.tools[tool_name] = tool_spec
+        registry.handlers[tool_name] = run_tool
         return json.dumps({"ok": True, "tool_name": tool_name, "saved_to": str(out_dir)})
 
     return handler
+
+
+def _load_saved_analysis_tools(
+    *,
+    scripts_root: Path,
+) -> list[tuple[str, str, Path]]:
+    """Return a list of (tool_name, description, script_path) for the newest saved version of each tool.
+
+    Expected on-disk layout (created by create_and_register_analysis_tool):
+      scripts_root/<tool_name>/<timestamp>/<tool_name>.py
+      scripts_root/<tool_name>/<timestamp>/tool.json
+    """
+
+    root = Path(scripts_root).resolve()
+    if not root.exists() or not root.is_dir():
+        return []
+
+    latest: dict[str, tuple[str, str, Path]] = {}
+    for tool_dir in root.iterdir():
+        if not tool_dir.is_dir():
+            continue
+        tool_name = tool_dir.name
+        try:
+            _validate_tool_name(tool_name)
+        except Exception:
+            continue
+
+        # Pick the newest timestamp directory (lexicographic is fine with UTC ts format).
+        versions = [p for p in tool_dir.iterdir() if p.is_dir()]
+        if not versions:
+            continue
+        versions.sort(key=lambda p: p.name, reverse=True)
+        vdir = versions[0]
+        meta = vdir / "tool.json"
+        script = vdir / f"{tool_name}.py"
+        if not meta.exists() or not script.exists():
+            continue
+
+        try:
+            md = json.loads(meta.read_text(encoding="utf-8"))
+            if not isinstance(md, dict):
+                continue
+            desc = md.get("description")
+            if not isinstance(desc, str) or not desc.strip():
+                continue
+        except Exception:
+            continue
+
+        latest[tool_name] = (tool_name, desc.strip(), script)
+
+    return list(latest.values())
+
+
+def list_saved_analysis_tool_names(*, scripts_root: Path) -> list[str]:
+    """List saved analysis tool names on disk (newest version per tool_name)."""
+
+    names = [t[0] for t in _load_saved_analysis_tools(scripts_root=scripts_root)]
+    names.sort()
+    return names
+
+
+def register_saved_analysis_tools(
+    *,
+    registry: ToolRegistry,
+    python_sandbox_handler: FunctionHandler,
+    scripts_root: Path,
+) -> list[str]:
+    """Register previously saved analysis tools into the provided registry.
+
+    Returns the list of tool names registered (newest version per tool_name).
+    """
+
+    loaded = _load_saved_analysis_tools(scripts_root=scripts_root)
+    names: list[str] = []
+
+    for tool_name, desc, script_path in loaded:
+        # Register a tool that runs this script via python_sandbox.
+        tool_spec: JsonDict = {
+            "type": "function",
+            "name": tool_name,
+            "description": str(desc),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "object", "description": "Arbitrary JSON passed to the script as `args`."},
+                    "copy_from_repo": {"type": "array", "items": {"type": "string"}},
+                    "copy_globs": {"type": "array", "items": {"type": "string"}},
+                    "timeout_s": {"type": "number"},
+                },
+                "additionalProperties": False,
+            },
+        }
+
+        def run_tool(call_args: JsonDict, *, _script=script_path) -> str:
+            tool_args = call_args.get("args")
+            if tool_args is None:
+                tool_args = {}
+            if not isinstance(tool_args, dict):
+                raise ToolError("args must be an object")
+
+            input_files = {"tool_args.json": json.dumps(tool_args, ensure_ascii=False)}
+            payload: JsonDict = {
+                "code": (
+                    "import json\n"
+                    "from pathlib import Path\n"
+                    "args = json.loads(Path('tool_args.json').read_text(encoding='utf-8'))\n"
+                    f"# --- user script: {_script.name} ---\n"
+                    + _script.read_text(encoding="utf-8", errors="replace")
+                ),
+                "input_files": input_files,
+            }
+            for k in ("copy_from_repo", "copy_globs", "timeout_s"):
+                v = call_args.get(k)
+                if v is not None:
+                    payload[k] = v
+            return python_sandbox_handler(payload)
+
+        # Overwrite if already present (e.g., if user loaded tools earlier in the session).
+        registry.tools[tool_name] = tool_spec
+        registry.handlers[tool_name] = run_tool
+        names.append(tool_name)
+
+    names.sort()
+    return names
 
 
 def set_system_prompt_tool_spec() -> JsonDict:

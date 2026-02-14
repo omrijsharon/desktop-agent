@@ -66,6 +66,7 @@ SUPPORTED_MODELS: tuple[str, ...] = (
 )
 
 DEFAULT_MODEL: str = "gpt-5.2-2025-12-11"
+# DEFAULT_MODEL: str = "gpt-5.3-codex-spark"
 
 
 @dataclass(frozen=True)

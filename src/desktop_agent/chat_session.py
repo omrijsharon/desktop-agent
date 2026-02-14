@@ -9,6 +9,7 @@ interactive chat + tool use (including dynamic tool creation and submodels).
 from __future__ import annotations
 
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,9 +22,11 @@ import subprocess
 import sys
 import threading
 import time
+import logging
 from multiprocessing.connection import Listener
 
 from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError
 
 from .config import DEFAULT_MODEL
 from .chat_store import new_chat_id
@@ -38,12 +41,14 @@ from .tools import (
     make_create_and_register_python_tool_handler,
     make_get_system_prompt_handler,
     make_python_sandbox_handler,
+    make_render_plot_handler,
     make_create_and_register_analysis_tool_handler,
     make_read_file_handler,
     make_set_system_prompt_handler,
     self_tool_creator_handler,
     self_tool_creator_tool_spec,
     python_sandbox_tool_spec,
+    render_plot_tool_spec,
     create_and_register_analysis_tool_spec,
     read_file_tool_spec,
     run_responses_with_function_tools,
@@ -54,10 +59,42 @@ from .tools import (
     submodel_close_tool_spec,
     submodel_list_tool_spec,
     run_responses_with_function_tools_stream,
+    register_saved_analysis_tools,
 )
+from .model_caps import ModelCapsStore
 
 
 JsonDict = dict[str, Any]
+
+
+_SUBLOG = logging.getLogger("desktop_agent.submodels")
+_LOG = logging.getLogger("desktop_agent.chat_session")
+
+
+def _ensure_submodel_logging(*, base_dir: Path) -> None:
+    """Log submodel activity to terminal + chat_history/chat_ui.log (append)."""
+
+    if getattr(_SUBLOG, "_configured", False):
+        return
+    try:
+        log_path = (base_dir / "chat_history" / "chat_ui.log").resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _SUBLOG.setLevel(logging.INFO)
+        _SUBLOG.propagate = False
+        fh = logging.FileHandler(str(log_path), mode="a", encoding="utf-8")
+        sh = logging.StreamHandler()
+        fmt = logging.Formatter(
+            fmt="%(asctime)s.%(msecs)03d %(levelname)s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        fh.setFormatter(fmt)
+        sh.setFormatter(fmt)
+        _SUBLOG.handlers.clear()
+        _SUBLOG.addHandler(fh)
+        _SUBLOG.addHandler(sh)
+        setattr(_SUBLOG, "_configured", True)
+    except Exception:
+        setattr(_SUBLOG, "_configured", True)
 
 
 def _as_dict(x: Any) -> JsonDict:
@@ -82,6 +119,94 @@ def _as_dict(x: Any) -> JsonDict:
         return json.loads(json.dumps(x, default=lambda o: getattr(o, "__dict__", str(o))))
     except Exception:
         return {"_repr": repr(x)}
+
+
+def _strip_status_keys(items: list[JsonDict]) -> list[JsonDict]:
+    out: list[JsonDict] = []
+    for it in items:
+        if isinstance(it, dict) and "status" in it:
+            d = dict(it)
+            d.pop("status", None)
+            out.append(d)
+        else:
+            out.append(it)
+    return out
+
+
+def _strip_reasoning_items(items: list[JsonDict]) -> list[JsonDict]:
+    """Drop output-only reasoning items from stored conversation history.
+
+    Some models emit `reasoning` items in the returned `input` list. Replaying those
+    items back into the next `responses.create(input=...)` call can cause 400s.
+    We still surface them to the UI via `new_items`, but we don't persist them.
+    """
+
+    out: list[JsonDict] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("type") in {"reasoning", "reasoning_summary"}:
+            continue
+        out.append(it)
+    return out
+
+
+def _strip_hash_commands_text(text: str) -> str:
+    """Remove `#commands` (no space) from user/assistant text.
+
+    Keeps markdown headings like `# Heading` (hash followed by a space).
+    """
+
+    t = str(text or "")
+    if "#" not in t:
+        return t
+    # Remove tokens like #skip / #foo_bar; keep markdown headings "# heading".
+    t = re.sub(r"#(\S+)", "", t)
+    # Collapse extra whitespace created by removals.
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _strip_hash_commands_in_messages(items: list[JsonDict]) -> list[JsonDict]:
+    """Remove `#commands` from message content items (input_text/output_text)."""
+
+    out: list[JsonDict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            out.append(it)
+            continue
+        role = it.get("role")
+        if role not in {"user", "assistant", "system"}:
+            out.append(it)
+            continue
+        content = it.get("content")
+        if not isinstance(content, list) or not content:
+            out.append(it)
+            continue
+        changed = False
+        new_content: list[Any] = []
+        for c in content:
+            if not isinstance(c, dict):
+                new_content.append(c)
+                continue
+            ctype = c.get("type")
+            if ctype in {"input_text", "output_text"} and isinstance(c.get("text"), str):
+                nt = _strip_hash_commands_text(str(c.get("text") or ""))
+                if nt != c.get("text"):
+                    cc = dict(c)
+                    cc["text"] = nt
+                    new_content.append(cc)
+                    changed = True
+                else:
+                    new_content.append(c)
+            else:
+                new_content.append(c)
+        if changed:
+            ni = dict(it)
+            ni["content"] = new_content
+            out.append(ni)
+        else:
+            out.append(it)
+    return out
 
 
 def _extract_usage(resp: Any) -> dict[str, int]:
@@ -134,14 +259,14 @@ class ChatConfig:
     allow_read_file: bool = True
     allow_write_files: bool = False
     hide_think: bool = False
-    allow_python_sandbox: bool = False
+    allow_python_sandbox: bool = True
     python_sandbox_timeout_s: float = 12.0
     allow_model_create_analysis_tools: bool = False
     allow_submodels: bool = True
     max_submodels: int = 6
     max_submodel_depth: int = 1
     submodel_depth: int = 0
-    submodel_ping_s: float = 1.0
+    submodel_ping_s: float = 2.0
 
 
 @dataclass
@@ -155,6 +280,7 @@ class ChatDelta:
 class ChatSession:
     def __init__(self, *, api_key: Optional[str] = None, config: Optional[ChatConfig] = None) -> None:
         self.cfg = config or ChatConfig()
+        _ensure_submodel_logging(base_dir=self.cfg.tool_base_dir)
         self._api_key = api_key
         self._client = OpenAI(api_key=api_key)
 
@@ -171,6 +297,10 @@ class ChatSession:
 
         self.registry = ToolRegistry(tools={}, handlers={})
         self._install_default_tools()
+
+        # Per-model compatibility cache (avoid repeating 400s for unsupported params).
+        caps_path = (self.cfg.tool_base_dir / "chat_history" / "model_caps.json").resolve()
+        self._model_caps = ModelCapsStore(path=caps_path)
 
         self._start_submodel_threads()
         self.reset(keep_system_prompt=True)
@@ -240,6 +370,10 @@ class ChatSession:
 
         self.registry.add(tool_spec=python_sandbox_tool_spec(), handler=gated_py)
 
+        # Visualization helper (alias around python_sandbox for plots/graphs)
+        render_plot = make_render_plot_handler(python_sandbox_handler=gated_py)
+        self.registry.add(tool_spec=render_plot_tool_spec(), handler=render_plot)
+
         # Reusable analysis tools (scripts that run via python_sandbox and can be registered on the fly)
         scripts_root = Path(__file__).resolve().parents[2] / "ui" / "automated_calibration" / "analysis_tools"
         create_analysis = make_create_and_register_analysis_tool_handler(
@@ -254,6 +388,14 @@ class ChatSession:
             return create_analysis(args)
 
         self.registry.add(tool_spec=create_and_register_analysis_tool_spec(), handler=gated_create_analysis)
+
+        # Load any previously created analysis tools from disk so the model can reuse them.
+        try:
+            loaded = register_saved_analysis_tools(registry=self.registry, python_sandbox_handler=gated_py, scripts_root=scripts_root)
+            if loaded:
+                _SUBLOG.info("analysis_tools_loaded count=%d names=%s", len(loaded), ",".join(loaded[:50]))
+        except Exception as e:  # noqa: BLE001
+            _SUBLOG.info("analysis_tools_load_failed error=%s", str(e))
 
         # submodels (parallelizable helper sessions)
         self.registry.add(tool_spec=submodel_list_tool_spec(), handler=self._tool_submodel_list)
@@ -335,8 +477,11 @@ class ChatSession:
         if not isinstance(user_text, str) or not user_text.strip():
             raise ValueError("user_text must be non-empty")
 
+        # Ensure history is replay-safe (no output-only items/keys/commands).
+        self._conversation = _strip_hash_commands_in_messages(_strip_reasoning_items(_strip_status_keys(list(self._conversation))))
+
         start_len = len(self._conversation)
-        self._conversation.append(_input_text("user", user_text.strip()))
+        self._conversation.append(_input_text("user", _strip_hash_commands_text(user_text.strip())))
 
         create_kwargs: dict[str, Any] = {}
         if self.cfg.temperature is not None:
@@ -346,9 +491,12 @@ class ChatSession:
         if self.cfg.max_output_tokens is not None:
             create_kwargs["max_output_tokens"] = int(self.cfg.max_output_tokens)
         if self.cfg.max_tool_calls is not None:
-            create_kwargs["max_tool_calls"] = int(self.cfg.max_tool_calls)
+            mtc = int(self.cfg.max_tool_calls)
+            if mtc >= 1:
+                create_kwargs["max_tool_calls"] = mtc
         if self.cfg.enable_file_search and self.cfg.include_file_search_results:
             create_kwargs["include"] = ["file_search_call.results"]
+        create_kwargs = self._model_caps.filter_create_kwargs(model=self.cfg.model, create_kwargs=create_kwargs)
 
         resp, updated = run_responses_with_function_tools(
             client=self._client,
@@ -359,13 +507,16 @@ class ChatSession:
             instructions_provider=lambda: self._system_prompt,
             max_rounds=12,
             return_input_items=True,
+            on_unsupported_param=lambda p: self._model_caps.mark_unsupported(model=self.cfg.model, param=p),
             **create_kwargs,
         )
 
         assistant_text = getattr(resp, "output_text", "") or ""
         self._last_usage = _extract_usage(resp)
         updated_dicts = [_as_dict(x) for x in updated]
+        updated_dicts = _strip_status_keys(updated_dicts)
         new_items = updated_dicts[start_len:]
+        updated_state = _strip_hash_commands_in_messages(_strip_reasoning_items(updated_dicts))
 
         # Update a simple title heuristic if still default.
         if self.title == "New chat":
@@ -376,7 +527,7 @@ class ChatSession:
             self._conversation = []
             self._reset_after_turn = False
         else:
-            self._conversation = updated_dicts
+            self._conversation = updated_state
         return ChatDelta(new_items=new_items, assistant_text=str(assistant_text))
 
     def send_stream(
@@ -388,8 +539,11 @@ class ChatSession:
         if not isinstance(user_text, str) or not user_text.strip():
             raise ValueError("user_text must be non-empty")
 
+        # Ensure history is replay-safe (no output-only items/keys/commands).
+        self._conversation = _strip_hash_commands_in_messages(_strip_reasoning_items(_strip_status_keys(list(self._conversation))))
+
         start_len = len(self._conversation)
-        self._conversation.append(_input_text("user", user_text.strip()))
+        self._conversation.append(_input_text("user", _strip_hash_commands_text(user_text.strip())))
 
         create_kwargs: dict[str, Any] = {}
         if self.cfg.temperature is not None:
@@ -399,9 +553,12 @@ class ChatSession:
         if self.cfg.max_output_tokens is not None:
             create_kwargs["max_output_tokens"] = int(self.cfg.max_output_tokens)
         if self.cfg.max_tool_calls is not None:
-            create_kwargs["max_tool_calls"] = int(self.cfg.max_tool_calls)
+            mtc = int(self.cfg.max_tool_calls)
+            if mtc >= 1:
+                create_kwargs["max_tool_calls"] = mtc
         if self.cfg.enable_file_search and self.cfg.include_file_search_results:
             create_kwargs["include"] = ["file_search_call.results"]
+        create_kwargs = self._model_caps.filter_create_kwargs(model=self.cfg.model, create_kwargs=create_kwargs)
 
         final_resp_dict: dict[str, Any] | None = None
         updated_input: list[JsonDict] | None = None
@@ -409,6 +566,11 @@ class ChatSession:
         # Because `on_text_delta` is a callback, we collect events in a local list
         # and drain them as the stream progresses.
         events: list[dict[str, Any]] = []
+        assistant_so_far: list[str] = []
+
+        def _on_text_delta(d: str) -> None:
+            assistant_so_far.append(d)
+            events.append({"type": "assistant_delta", "delta": d})
 
         stream_iter = run_responses_with_function_tools_stream(
             client=self._client,
@@ -420,27 +582,84 @@ class ChatSession:
             max_rounds=12,
             return_input_items=True,
             on_item=on_item,
-            on_text_delta=lambda d: events.append({"type": "assistant_delta", "delta": d}),
+            on_text_delta=_on_text_delta,
+            on_unsupported_param=lambda p: self._model_caps.mark_unsupported(model=self.cfg.model, param=p),
             **create_kwargs,
         )
 
-        for ev in stream_iter:
-            # Drain any buffered deltas first so UI updates feel immediate.
-            while events:
-                yield events.pop(0)
+        stream_error: Exception | None = None
+        try:
+            for ev in stream_iter:
+                # Drain any buffered deltas first so UI updates feel immediate.
+                while events:
+                    yield events.pop(0)
 
-            et = ev.get("type")
-            if et == "done":
-                respd = ev.get("response")
-                final_resp_dict = respd if isinstance(respd, dict) else None
-            elif et == "input_items":
-                inp = ev.get("input")
-                updated_input = inp if isinstance(inp, list) else None
-            # Hide internal stream events from the UI; we only surface assistant deltas
-            # (via the buffered callback) and the final `turn_done`.
+                et = ev.get("type")
+                if et == "done":
+                    respd = ev.get("response")
+                    final_resp_dict = respd if isinstance(respd, dict) else None
+                elif et == "input_items":
+                    inp = ev.get("input")
+                    updated_input = inp if isinstance(inp, list) else None
+                # Hide internal stream events from the UI; we only surface assistant deltas
+                # (via the buffered callback) and the final `turn_done`.
+        except Exception as e:  # noqa: BLE001
+            stream_error = e
 
         while events:
             yield events.pop(0)
+
+        if stream_error is not None:
+            # Network hiccups (or server-side disconnects) can kill a long-running stream.
+            # Treat this as a soft failure: preserve any partial assistant text in history
+            # and surface an error event so UIs can show a useful message instead of
+            # crashing the worker thread.
+            partial = "".join(assistant_so_far).strip()
+
+            # Detect common transient classes (best-effort; don't require httpx at import time).
+            is_transient = isinstance(stream_error, (APIConnectionError, APITimeoutError))
+            try:
+                import httpx  # type: ignore
+
+                is_transient = is_transient or isinstance(
+                    stream_error,
+                    (
+                        httpx.RemoteProtocolError,
+                        httpx.ReadError,
+                        httpx.ConnectError,
+                        httpx.WriteError,
+                        httpx.TimeoutException,
+                    ),
+                )
+            except Exception:
+                pass
+
+            msg = f"{type(stream_error).__name__}: {stream_error}"
+            if is_transient:
+                msg = f"(stream disconnected) {msg}"
+
+            if partial:
+                # Keep the partial answer, but annotate that it was interrupted.
+                self._conversation.append(
+                    _input_text(
+                        "assistant",
+                        f"{partial}\n\n[stream interrupted: {msg}]",
+                    )
+                )
+            else:
+                self._conversation.append(_input_text("assistant", f"[stream error: {msg}]"))
+
+            updated_input = list(self._conversation)
+            updated_dicts = [_as_dict(x) for x in updated_input]
+            updated_dicts = _strip_status_keys(updated_dicts)
+            new_items = updated_dicts[start_len:]
+            updated_state = _strip_hash_commands_in_messages(_strip_reasoning_items(updated_dicts))
+            self._conversation = updated_state
+
+            _LOG.warning("Streaming turn failed; preserved partial assistant text. error=%s", msg)
+            yield {"type": "error", "error": msg, "transient": bool(is_transient)}
+            yield {"type": "turn_done", "new_items": new_items}
+            return
 
         if final_resp_dict is not None:
             self._last_usage = _extract_usage(final_resp_dict)
@@ -448,7 +667,9 @@ class ChatSession:
             updated_input = self._conversation
 
         updated_dicts = [_as_dict(x) for x in updated_input]
+        updated_dicts = _strip_status_keys(updated_dicts)
         new_items = updated_dicts[start_len:]
+        updated_state = _strip_hash_commands_in_messages(_strip_reasoning_items(updated_dicts))
 
         # Update title heuristic if still default.
         if self.title == "New chat":
@@ -458,7 +679,7 @@ class ChatSession:
             self._conversation = []
             self._reset_after_turn = False
         else:
-            self._conversation = updated_dicts
+            self._conversation = updated_state
 
         yield {"type": "turn_done", "new_items": new_items}
 
@@ -539,7 +760,7 @@ class ChatSession:
             "include_file_search_results": bool(self.cfg.include_file_search_results),
             "allow_python_sandbox": bool(self.cfg.allow_python_sandbox),
             "python_sandbox_timeout_s": float(self.cfg.python_sandbox_timeout_s),
-            "conversation": list(self._conversation),
+            "conversation": list(_strip_status_keys(_strip_hash_commands_in_messages(_strip_reasoning_items(list(self._conversation))))),
             "submodels": {sid: sm.to_record() for sid, sm in self._submodels.items()},
             "submodel_depth": int(self.cfg.submodel_depth),
         }
@@ -567,7 +788,9 @@ class ChatSession:
             pass
         self._system_prompt = str(rec.get("system_prompt") or self._system_prompt)
         conv = rec.get("conversation")
-        self._conversation = conv if isinstance(conv, list) else []
+        self._conversation = (
+            _strip_hash_commands_in_messages(_strip_reasoning_items(_strip_status_keys(conv))) if isinstance(conv, list) else []
+        )
 
         self._submodels = {}
         subs = rec.get("submodels")
@@ -605,6 +828,7 @@ class ChatSession:
         existed = sid in self._submodels
         sm = self._submodels.pop(sid, None)
         if sm is not None:
+            _SUBLOG.info("submodel_close submodel_id=%s title=%s model=%s", sm.submodel_id, sm.title, sm.model)
             sm.stop()
         return existed
 
@@ -622,6 +846,11 @@ class ChatSession:
         self._submodel_listener = Listener(("127.0.0.1", 0), authkey=auth)
         self._submodel_auth_hex = auth.hex()
         self._submodel_stop.clear()
+        try:
+            host, port = self._submodel_listener.address
+            _SUBLOG.info("submodel_listener_start host=%s port=%s", str(host), str(port))
+        except Exception:
+            pass
 
         def accept_loop() -> None:
             assert self._submodel_listener is not None
@@ -668,6 +897,7 @@ class ChatSession:
                     try:
                         sm.ping()
                     except Exception:
+                        _SUBLOG.info("submodel_ping_failed submodel_id=%s title=%s model=%s state=%s", sm.submodel_id, sm.title, sm.model, sm.state)
                         pass
                 time.sleep(interval)
 
@@ -688,6 +918,7 @@ class ChatSession:
         except Exception:
             pass
         self._submodel_listener = None
+        _SUBLOG.info("submodel_listener_stop")
 
     def shutdown(self) -> None:
         """Terminate submodel workers and stop background threads."""
@@ -768,17 +999,20 @@ class ChatSession:
         )
         sm.start_reader()
         self._submodels[sm.submodel_id] = sm
+        _SUBLOG.info("submodel_spawned submodel_id=%s title=%s model=%s allow_nested=%s", sm.submodel_id, sm.title, sm.model, bool(allow_nested))
         return sm
 
     # ---- tool handlers ----
 
     def _tool_submodel_list(self, args: JsonDict) -> str:  # noqa: ARG001
+        _SUBLOG.info("tool_submodel_list")
         return json.dumps({"ok": True, "submodels": self.list_submodels()})
 
     def _tool_submodel_close(self, args: JsonDict) -> str:
         sid = args.get("submodel_id")
         if not isinstance(sid, str) or not sid:
             raise ValueError("submodel_id must be a string")
+        _SUBLOG.info("tool_submodel_close submodel_id=%s", sid)
         existed = self.close_submodel(sid)
         return json.dumps({"ok": True, "submodel_id": sid, "existed": existed})
 
@@ -789,6 +1023,7 @@ class ChatSession:
         if not isinstance(tasks, list):
             raise ValueError("tasks must be a list")
         parallel = bool(args.get("parallel", True))
+        _SUBLOG.info("tool_submodel_batch tasks=%d parallel=%s", len(tasks), bool(parallel))
 
         # Build a stable list of (task_index, submodel, input, keep)
         prepared: list[tuple[int, _SubprocessSubmodel, str, bool]] = []
@@ -849,6 +1084,7 @@ class ChatSession:
                         self.close_submodel(sm.submodel_id)
 
         results.sort(key=lambda x: int(x.get("i", 0)))
+        _SUBLOG.info("tool_submodel_batch_done created=%d results=%d", len(created_ids), len(results))
         return json.dumps({"ok": True, "created": created_ids, "results": results})
 
 
@@ -899,10 +1135,29 @@ class _SubprocessSubmodel:
                     msg = self.conn.recv()
                 except Exception:
                     self.state = "stopped"
+                    try:
+                        _SUBLOG.info("submodel_reader_stopped submodel_id=%s title=%s model=%s", self.submodel_id, self.title, self.model)
+                    except Exception:
+                        pass
                     break
                 if not isinstance(msg, dict):
                     continue
                 mtype = msg.get("type")
+                try:
+                    if mtype == "assistant":
+                        tprev = msg.get("text")
+                        tprev = str(tprev) if isinstance(tprev, str) else ""
+                        if len(tprev) > 140:
+                            tprev = tprev[:140] + " …"
+                        _SUBLOG.info("submodel_msg submodel_id=%s type=assistant text=%s", self.submodel_id, tprev)
+                    elif mtype == "error":
+                        _SUBLOG.info("submodel_msg submodel_id=%s type=error error=%s", self.submodel_id, str(msg.get("error") or ""))
+                    elif mtype == "status":
+                        _SUBLOG.info("submodel_msg submodel_id=%s type=status state=%s", self.submodel_id, str(msg.get("state") or ""))
+                    else:
+                        _SUBLOG.info("submodel_msg submodel_id=%s type=%s", self.submodel_id, str(mtype))
+                except Exception:
+                    pass
                 if mtype == "status":
                     st = msg.get("state")
                     if isinstance(st, str):

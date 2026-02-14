@@ -180,6 +180,47 @@ QCheckBox::indicator:checked {
   background: rgba(255, 255, 255, 14);
 }
 
+#btn_toggle {
+  background: rgba(255, 255, 255, 10);
+  color: rgba(255, 255, 255, 220);
+  border: 1px solid rgba(255, 255, 255, 18);
+  border-radius: 12px;
+  padding: 9px 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+#btn_toggle:hover {
+  background: rgba(255, 255, 255, 14);
+}
+
+#btn_toggle:checked {
+  background: rgba(74, 136, 255, 200);
+  border: 1px solid rgba(140, 92, 255, 220);
+}
+
+QListView#mention_popup,
+QListWidget#mention_popup {
+  background: rgba(18, 20, 24, 245);
+  color: rgba(255, 255, 255, 235);
+  border: 1px solid rgba(255, 255, 255, 22);
+  border-radius: 12px;
+  padding: 6px;
+  outline: 0;
+  font-size: 12px;
+}
+
+QListView#mention_popup::item,
+QListWidget#mention_popup::item {
+  padding: 6px 10px;
+  border-radius: 10px;
+}
+
+QListView#mention_popup::item:selected,
+QListWidget#mention_popup::item:selected {
+  background: rgba(74, 136, 255, 170);
+}
+
 QTextBrowser#bubble_text {
   background: transparent;
   border: 0px;

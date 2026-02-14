@@ -57,6 +57,52 @@ class RunConfig:
     analysis: AnalysisConfig
 
 
+def build_analysis_system_prompt(*, cfg: AnalysisConfig, saved_analysis_tools: list[str] | None = None) -> str:
+    """Build the system prompt for the automated calibration analysis session.
+
+    Design goal:
+    - Everything in the config menu (debug mapping, Betaflight snippet, control params, extra context)
+      should live in the system prompt, so user turns can be short (e.g., just file paths).
+    """
+
+    debug = "\n".join(cfg.debug_mapping or []).strip()
+    bf = (cfg.betaflight_snippet or "").strip()
+    extra = (cfg.extra_context or "").strip()
+    ctrl = cfg.control_params or {}
+    tools = list(saved_analysis_tools or [])
+
+    parts: list[str] = []
+    parts.append((cfg.system_prompt or "").strip() or "You are a helpful assistant.")
+
+    parts.append(
+        "You are analyzing EKF/PID calibration logs from a drone.\n"
+        "When the user provides file paths, start the analysis immediately.\n"
+        "Prefer using `python_sandbox` (copy_from_repo/copy_globs) for parsing and plotting.\n"
+        "Output concrete recommendations: which parameters to change and suggested values/ranges, with reasoning.\n"
+        "If more Betaflight code is required, ask for the specific missing function/section.\n"
+    )
+
+    if tools:
+        parts.append(
+            "Reusable analysis tools may already exist (created earlier via `create_and_register_analysis_tool`).\n"
+            "Prefer calling an existing analysis tool before rewriting scripts.\n"
+            "Saved analysis tool names:\n- " + "\n- ".join(tools)
+        )
+
+    if debug:
+        parts.append("Debug value mapping:\n" + debug)
+
+    parts.append("Control parameters / gains (JSON):\n" + json.dumps(ctrl, indent=2, ensure_ascii=False))
+
+    if bf:
+        parts.append("Relevant Betaflight snippet(s):\n" + bf)
+
+    if extra:
+        parts.append("Extra context:\n" + extra)
+
+    return "\n\n".join(p for p in parts if p.strip()).strip() + "\n"
+
+
 def _must_str(d: JsonDict, key: str) -> str:
     v = d.get(key)
     if not isinstance(v, str) or not v.strip():
@@ -94,6 +140,12 @@ def load_run_config(path: str | Path) -> RunConfig:
         raise ValueError("pi_ap/hotspot/pi_ssh must be objects")
     if not isinstance(remote_d, dict) or not isinstance(local_d, dict) or not isinstance(analysis_d, dict):
         raise ValueError("remote/local/analysis must be objects")
+
+    # Decode file representation ("\\n") back to real newlines for UI + analysis.
+    bf_snip = analysis_d.get("betaflight_snippet")
+    if isinstance(bf_snip, str) and "\\n" in bf_snip:
+        analysis_d = dict(analysis_d)
+        analysis_d["betaflight_snippet"] = bf_snip.replace("\\n", "\n")
 
     pi_ap = WifiConfig(ssid=_must_str(pi_ap_d, "ssid"), password=_must_str(pi_ap_d, "password"))
     hotspot = WifiConfig(ssid=_must_str(hotspot_d, "ssid"), password=_must_str(hotspot_d, "password"))
@@ -135,7 +187,19 @@ def example_run_config_path() -> Path:
 def save_run_config(path: str | Path, data: JsonDict) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, indent=2, ensure_ascii=False).replace("\r\n", "\n") + "\n"
+    # Keep `betaflight_snippet` JSON-friendly and easy to diff: represent newlines as
+    # literal "\\n" sequences in the file. (We decode back to real newlines on load.)
+    d = dict(data) if isinstance(data, dict) else {"data": data}
+    analysis = d.get("analysis")
+    if isinstance(analysis, dict):
+        a2 = dict(analysis)
+        bf = a2.get("betaflight_snippet")
+        if isinstance(bf, str):
+            bf = bf.replace("\r\n", "\n").replace("\n", "\\n")
+            a2["betaflight_snippet"] = bf
+        d["analysis"] = a2
+
+    text = json.dumps(d, indent=2, ensure_ascii=False).replace("\r\n", "\n") + "\n"
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(p)

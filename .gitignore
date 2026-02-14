@@ -29,6 +29,9 @@ build/
 # Logs
 *.log
 
+# Python sandbox run outputs (runtime artifacts)
+python_sandbox_runs/
+
 # OS
 .DS_Store
 Thumbs.db
