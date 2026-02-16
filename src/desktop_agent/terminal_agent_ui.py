@@ -43,6 +43,10 @@ _DONE_RE = re.compile(r"__TA_DONE__[0-9a-f]{6,32}", re.IGNORECASE)
 _LINUX_PROMPT_RE = re.compile(r"(?m)^[^\r\n]{0,80}@[^\r\n]{1,80}:[^\r\n]{0,200}[$#]\s*$")
 
 
+class _UiBridge(QtCore.QObject):
+    append_chat = QtCore.Signal(str, str, str)  # tab_id, kind, text
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -857,6 +861,8 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._hide_think = False
         self._tabs: dict[str, _TabState] = {}
         self._active_tab_id: str | None = None
+        self._ui_bridge = _UiBridge(self)
+        self._ui_bridge.append_chat.connect(self._on_append_chat, QtCore.Qt.ConnectionType.QueuedConnection)
 
         self._build_ui()
         self._apply_style()
@@ -1220,6 +1226,10 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
             with peer.session_lock:
                 from_name = self._tabs[caller_id].name if caller_id in self._tabs else "peer"
+                try:
+                    self._ui_bridge.append_chat.emit(peer.tab_id, "tool", f"[peer request] {from_name}: {message.strip()}")
+                except Exception:
+                    pass
                 pending = (
                     f"[peer_request]\nFrom: {from_name}\nTask: {message.strip()}\n\n"
                     "If you need to run commands, emit <Terminal>...</Terminal> blocks.\n"
@@ -1240,6 +1250,11 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                         + "\n---\n".join(parts)
                         + "\n\nContinue. If more commands are needed, emit more <Terminal> blocks; otherwise reply with a summary."
                     )
+
+                try:
+                    self._ui_bridge.append_chat.emit(peer.tab_id, "assistant", strip_terminal_blocks(last_assistant))
+                except Exception:
+                    pass
 
             return json.dumps(
                 {"ok": True, "peer": peer.name, "text": strip_terminal_blocks(last_assistant)},
@@ -1268,6 +1283,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             self._cwd_label.setText(str(_repo_root()))
 
     # ---- chat helpers ----
+
+    @QtCore.Slot(str, str, str)
+    def _on_append_chat(self, tab_id: str, kind: str, text: str) -> None:
+        try:
+            self._append_chat(str(text or ""), kind=str(kind or "tool"), tab_id=str(tab_id or ""))
+        except Exception:
+            pass
 
     def _append_chat(self, text: str, *, kind: str, tab_id: str | None = None) -> Bubble:
         st = self._tabs[tab_id] if (isinstance(tab_id, str) and tab_id in self._tabs) else self._active_tab()
