@@ -96,6 +96,100 @@ def strip_terminal_blocks(text: str) -> str:
     return t
 
 
+def _truncate_terminal_lines(text: str, *, max_lines: int = 20) -> str:
+    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if max_lines >= 1 and len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    # Don't strip internal whitespace; preserve exact commands.
+    return "\n".join(lines).strip("\n")
+
+
+def _sanitize_terminal_blocks_in_conversation(
+    conversation_items: list[JsonDict], *, latest_terminal_window: str | None
+) -> list[JsonDict]:
+    """Ensure only the latest <Terminal> block is kept in history, truncated to a rolling window."""
+
+    # Find the last item+text-part that contains any <Terminal> block.
+    last_pos: tuple[int, int] | None = None
+    last_txt_with_block: str | None = None
+    for i, item in enumerate(conversation_items):
+        contents = item.get("content")
+        if not isinstance(contents, list):
+            continue
+        for j, part in enumerate(contents):
+            if not isinstance(part, dict):
+                continue
+            txt = part.get("text")
+            if isinstance(txt, str) and _TERM_BLOCK_RE.search(txt or ""):
+                last_pos = (i, j)
+                last_txt_with_block = txt
+
+    # Nothing to sanitize.
+    if last_pos is None:
+        return conversation_items
+
+    latest = (latest_terminal_window or "").strip()
+    if latest_terminal_window is None:
+        # Preserve the most recent block already present in the conversation. This keeps a rolling
+        # window in-context while still preventing the history from growing unbounded.
+        existing_blocks = extract_terminal_blocks(last_txt_with_block or "")
+        latest = (existing_blocks[-1] if existing_blocks else "").strip()
+    latest = _truncate_terminal_lines(latest, max_lines=20) if latest else ""
+
+    i_keep, j_keep = last_pos
+    for i, item in enumerate(conversation_items):
+        contents = item.get("content")
+        if not isinstance(contents, list):
+            continue
+        for j, part in enumerate(contents):
+            if not isinstance(part, dict):
+                continue
+            txt = part.get("text")
+            if not isinstance(txt, str) or not _TERM_BLOCK_RE.search(txt or ""):
+                continue
+            # Strip all existing terminal blocks.
+            cleaned = strip_terminal_blocks(txt)
+            # Re-add only the latest rolling window on the last occurrence.
+            if (i, j) == (i_keep, j_keep) and latest:
+                cleaned = (cleaned + "\n\n" if cleaned else "") + f"<Terminal>\n{latest}\n</Terminal>"
+            part["text"] = cleaned
+
+    return conversation_items
+
+
+def _wait_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "wait",
+        "description": "Wait/sleep for a short time (0–5 seconds) to avoid busy-checking.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "seconds": {
+                    "type": "number",
+                    "description": "Seconds to wait (0–5). Defaults to 1.",
+                    "minimum": 0.0,
+                    "maximum": 5.0,
+                    "default": 1.0,
+                }
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _wait_tool_handler(args: JsonDict) -> str:
+    seconds = args.get("seconds", 1.0)
+    try:
+        s = float(seconds)
+    except Exception:
+        return json.dumps({"ok": False, "error": "seconds must be a number"}, ensure_ascii=False)
+    s = max(0.0, min(5.0, s))
+    time.sleep(s)
+    return json.dumps({"ok": True, "slept_s": s}, ensure_ascii=False)
+
+
 def _peer_agent_ask_tool_spec() -> JsonDict:
     return {
         "type": "function",
@@ -739,6 +833,14 @@ class _Worker(QtCore.QThread):
                 if self.isInterruptionRequested():
                     return
 
+                # Ensure history doesn't accumulate many <Terminal> blocks. Keep only the latest.
+                try:
+                    conv = getattr(self.session, "_conversation", None)
+                    if isinstance(conv, list):
+                        _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=None)
+                except Exception:
+                    pass
+
                 full_raw = ""
                 last_emit = 0.0
                 last_tok_emit = 0.0
@@ -787,6 +889,8 @@ class _Worker(QtCore.QThread):
 
                 self.signals.tool_msg.emit(f"[terminal] executing {len(blocks)} block(s)…")
                 results: list[CommandResult] = []
+                # Keep only the most recent <Terminal> block as context, with a rolling line window.
+                latest_window = _truncate_terminal_lines(blocks[-1], max_lines=20)
 
                 for b in blocks:
                     if self.isInterruptionRequested():
@@ -814,6 +918,14 @@ class _Worker(QtCore.QThread):
                         + ("STDOUT:\n" + so + "\n" if so else "STDOUT: (empty)\n")
                         + ("STDERR:\n" + se + "\n" if se else "STDERR: (empty)\n")
                     )
+
+                # Keep only a rolling window of the most recent <Terminal> block in the conversation state.
+                try:
+                    conv2 = getattr(self.session, "_conversation", None)
+                    if isinstance(conv2, list):
+                        _sanitize_terminal_blocks_in_conversation(conv2, latest_terminal_window=latest_window)
+                except Exception:
+                    pass
 
                 term_state = "unknown"
                 try:
@@ -917,10 +1029,22 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         s.set_system_prompt(
             (
                 f"You are Terminal Agent ({agent_name}), an assistant that can run PowerShell commands.\n"
+                "Your primary role is to use the terminal to help the user accomplish real tasks (not just give advice).\n"
                 "When you want to execute commands, emit a <Terminal>...</Terminal> block.\n"
+                "\n"
+                "Tools you can use:\n"
+                "- `TerminalExec`: emit a <Terminal>...</Terminal> block (the contents will be executed in the attached interactive PowerShell terminal via ConPTY).\n"
+                "- `web_search`: search the web for up-to-date information.\n"
+                "- `wait(seconds)`: waits up to 5 seconds when you need to pause for a dependency/process instead of repeatedly checking.\n"
+                "- `peer_agent_ask(peer_name, message)`: ask another terminal-tab agent for help.\n"
+                "- `peer_terminal_run(peer_name, command)`: run a command in another terminal tab.\n"
+                "\n"
                 "Anything inside <Terminal>...</Terminal> will be executed in the attached interactive PowerShell terminal (ConPTY).\n"
                 "This behaves like a real terminal: SSH is interactive and stays open, and you can run subsequent commands naturally.\n"
                 "Use `exit` to exit remote shells or close programs. The user can press Stop to reset the terminal.\n"
+                "\n"
+                "If the user asks to connect to the Pi / connect via SSH, prefer:\n"
+                "ssh -X omrijsharon@omrijsharon.local\n"
                 "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
                 "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
                 "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
@@ -930,6 +1054,10 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 "- You can run a command in another tab with `peer_terminal_run(peer_name, command)`.\n"
             )
         )
+        try:
+            s.registry.add(tool_spec=_wait_tool_spec(), handler=_wait_tool_handler)
+        except Exception:
+            pass
         return s
 
     # ---- UI ----
@@ -1236,9 +1364,27 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 )
                 last_assistant = ""
                 for _ in range(max_rounds):
+                    # Ensure peer history doesn't accumulate many <Terminal> blocks.
+                    try:
+                        conv = getattr(peer.session, "_conversation", None)
+                        if isinstance(conv, list):
+                            _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=None)
+                    except Exception:
+                        pass
+
                     delta = peer.session.send(pending)
                     last_assistant = str(delta.assistant_text or "")
                     blocks = extract_terminal_blocks(last_assistant)
+
+                    # Keep only a rolling window of the most recent terminal block in peer conversation.
+                    try:
+                        conv2 = getattr(peer.session, "_conversation", None)
+                        if isinstance(conv2, list):
+                            latest_peer = blocks[-1] if blocks else None
+                            _sanitize_terminal_blocks_in_conversation(conv2, latest_terminal_window=latest_peer)
+                    except Exception:
+                        pass
+
                     if not blocks:
                         break
                     parts: list[str] = []
