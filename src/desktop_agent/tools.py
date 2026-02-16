@@ -15,7 +15,10 @@ executing the function and sending back a `function_call_output` item.
 from __future__ import annotations
 
 import ast
+import base64
+import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -27,9 +30,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence
 
+from .dev_workspace import (
+    WorkspaceError,
+    append_text as ws_append_text,
+    create_venv as ws_create_venv,
+    ensure_workspace as ws_ensure_workspace,
+    http_server_start as ws_http_server_start,
+    http_server_stop as ws_http_server_stop,
+    list_dir as ws_list_dir,
+    pip_install as ws_pip_install,
+    read_text as ws_read_text,
+    run_venv_python as ws_run_venv_python,
+    venv_exists as ws_venv_exists,
+    venv_python_path as ws_venv_python_path,
+    write_text as ws_write_text,
+)
+
 
 JsonDict = dict[str, Any]
 FunctionHandler = Callable[[JsonDict], str]
+
+_LOG = logging.getLogger(__name__)
 
 
 def _drop_unsupported_param_from_error(e: Exception, create_kwargs: dict[str, Any]) -> str | None:
@@ -593,6 +614,457 @@ def default_self_tool_creator() -> tuple[list[JsonDict], dict[str, FunctionHandl
 
 
 # ---- Built-in tools ----
+
+def playwright_browser_tool_spec() -> JsonDict:
+    """Tool spec for controlling a Playwright MCP browser session."""
+
+    return {
+        "type": "function",
+        "name": "playwright_browser",
+        "description": (
+            "Control a real browser via the Playwright MCP server. "
+            "Use this for interactive web automation (navigate, click, type, snapshot, screenshot). "
+            "Common actions: browser_install (first time), browser_tabs, browser_navigate, "
+            "browser_snapshot, browser_take_screenshot, browser_click, browser_type, browser_press_key."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": (
+                        "A Playwright MCP tool name, e.g. browser_install, browser_navigate, browser_click, "
+                        "browser_type, browser_snapshot, browser_take_screenshot."
+                    ),
+                },
+                "params": {"type": "object", "description": "Arguments for the action.", "default": {}},
+                "restart": {"type": "boolean", "description": "If true, restart the browser session first.", "default": False},
+                "watch": {
+                    "type": "boolean",
+                    "description": "If true, automatically take a screenshot after the action (best-effort).",
+                    "default": False,
+                },
+                "screenshot_full_page": {
+                    "type": "boolean",
+                    "description": "When watch=true (or action is screenshot), request a full-page screenshot.",
+                    "default": False,
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def make_playwright_browser_handler(
+    *,
+    cmd: list[str],
+    repo_root: Path,
+    image_out_dir: Path,
+    startup_timeout_s: float = 60.0,
+    call_timeout_s: float = 120.0,
+    auto_install: bool = True,
+    fixed_image_name: str | None = None,
+) -> tuple[FunctionHandler, Callable[[], None]]:
+    """Create a handler for `playwright_browser` backed by a long-lived MCP server.
+
+    Returns:
+        (handler, shutdown)
+    """
+
+    repo_root = Path(repo_root).resolve()
+    image_out_dir = Path(image_out_dir).resolve()
+    image_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Lazy import so app still runs without this optional dependency.
+    try:
+        from agents.mcp import MCPServerStdio, MCPServerStdioParams  # type: ignore
+    except Exception as e:  # noqa: BLE001
+
+        def _missing(_: JsonDict) -> str:
+            return json.dumps({"ok": False, "error": f"Playwright MCP unavailable: {type(e).__name__}: {e}"})
+
+        return _missing, (lambda: None)
+
+    import asyncio
+    import threading
+
+    lock = threading.Lock()
+    loop: asyncio.AbstractEventLoop | None = None
+    server: MCPServerStdio | None = None
+    ready = threading.Event()
+    stop_ev: asyncio.Event | None = None
+    thread: threading.Thread | None = None
+    did_auto_install = False
+
+    def _start_thread() -> None:
+        nonlocal loop, server, stop_ev, thread
+        if thread is not None and thread.is_alive():
+            return
+
+        ready.clear()
+
+        def _runner() -> None:
+            nonlocal loop, server, stop_ev
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def _main() -> None:
+                nonlocal server, stop_ev
+                stop_ev = asyncio.Event()
+                params = MCPServerStdioParams(command=cmd[0], args=cmd[1:])
+                srv = MCPServerStdio(params, client_session_timeout_seconds=startup_timeout_s)
+                try:
+                    async with srv:
+                        server = srv
+                        ready.set()
+                        await stop_ev.wait()
+                finally:
+                    server = None
+
+            try:
+                loop.run_until_complete(_main())
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        thread.start()
+        if not ready.wait(timeout=startup_timeout_s + 5.0):
+            raise ToolError("Playwright MCP failed to start (timeout)")
+
+    def _shutdown() -> None:
+        nonlocal loop, server, stop_ev, thread
+        with lock:
+            if loop is not None and stop_ev is not None:
+                try:
+                    loop.call_soon_threadsafe(stop_ev.set)
+                except Exception:
+                    pass
+            loop = None
+            server = None
+            stop_ev = None
+            t = thread
+            thread = None
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=2.0)
+            except Exception:
+                pass
+
+    def _restart() -> None:
+        _shutdown()
+        _start_thread()
+
+    def _call_tool(action: str, params: dict[str, Any]) -> Any:
+        if loop is None or server is None:
+            _start_thread()
+        assert loop is not None
+        assert server is not None
+
+        async def _do() -> Any:
+            return await server.call_tool(action, params)
+
+        fut = asyncio.run_coroutine_threadsafe(_do(), loop)
+        return fut.result(timeout=call_timeout_s)
+
+    def _result_to_json(res: Any) -> JsonDict:
+        out_text_parts: list[str] = []
+        image_paths: list[str] = []
+        contents = getattr(res, "content", None)
+        if isinstance(contents, list):
+            for c in contents:
+                ctype = getattr(c, "type", None)
+                if ctype == "text":
+                    txt = getattr(c, "text", "")
+                    if isinstance(txt, str) and txt:
+                        out_text_parts.append(txt)
+                elif ctype == "image":
+                    data = getattr(c, "data", None)
+                    mime = getattr(c, "mimeType", None) or getattr(c, "mime_type", None)
+                    if isinstance(data, str) and data:
+                        ext = "png"
+                        if isinstance(mime, str) and "jpeg" in mime.lower():
+                            ext = "jpg"
+                        if isinstance(fixed_image_name, str) and fixed_image_name.strip():
+                            # Single-file mode (used by browser-first UIs): overwrite a stable filename.
+                            base = fixed_image_name.strip()
+                            if "." in base:
+                                name = base
+                            else:
+                                name = f"{base}.{ext}"
+                        else:
+                            name = f"pw_{uuid.uuid4().hex[:10]}.{ext}"
+                        abs_path = (image_out_dir / name).resolve()
+                        try:
+                            abs_path.write_bytes(base64.b64decode(data))
+                            rel = abs_path.relative_to(repo_root)
+                            image_paths.append(rel.as_posix())
+                        except Exception:
+                            continue
+        return {"text": "\n".join(out_text_parts).strip(), "image_paths": image_paths}
+
+    def _handler(args: JsonDict) -> str:
+        nonlocal did_auto_install
+        action = args.get("action")
+        if not isinstance(action, str) or not action.strip():
+            raise ToolError("action must be a non-empty string")
+        action = action.strip()
+        params = args.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise ToolError("params must be an object")
+        restart = bool(args.get("restart", False))
+        watch = bool(args.get("watch", False))
+        full_page = bool(args.get("screenshot_full_page", False))
+
+        with lock:
+            if restart:
+                _restart()
+            if (thread is None) or (not thread.is_alive()) or (server is None) or (loop is None):
+                _start_thread()
+
+        # Best-effort: ensure the Playwright browser binaries exist.
+        # Without this, the first "real" navigation can appear to do nothing while Playwright installs.
+        # We do it once per handler lifecycle.
+        if auto_install and (not did_auto_install) and action != "browser_install":
+            try:
+                _LOG.info("playwright_mcp_auto_install_start")
+                _call_tool("browser_install", {})
+                did_auto_install = True
+                _LOG.info("playwright_mcp_auto_install_done")
+            except Exception as e:  # noqa: BLE001
+                # Don't fail the user's action just because install failed.
+                _LOG.warning("playwright_mcp_auto_install_failed error=%s", f"{type(e).__name__}: {e}")
+
+        def do_call() -> Any:
+            return _call_tool(action, params)
+
+        try:
+            _LOG.info("playwright_mcp_call action=%s", action)
+            res = do_call()
+        except Exception as e:  # noqa: BLE001
+            # Best-effort auto-restart on common transport crashes.
+            msg = str(e)
+            retryable = any(x in msg.lower() for x in ("epipe", "broken pipe", "disconnected", "cannot switch to a different thread"))
+            if (not restart) and retryable:
+                try:
+                    with lock:
+                        _restart()
+                    res = do_call()
+                except Exception as e2:  # noqa: BLE001
+                    _LOG.error(
+                        "playwright_mcp_call_failed action=%s error=%s", action, f"{type(e2).__name__}: {e2}"
+                    )
+                    return json.dumps(
+                        {"ok": False, "error": f"{type(e2).__name__}: {e2}", "action": action, "hint": "try restart=true"},
+                        ensure_ascii=False,
+                    )
+            else:
+                _LOG.error("playwright_mcp_call_failed action=%s error=%s", action, f"{type(e).__name__}: {e}")
+                return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "action": action}, ensure_ascii=False)
+
+        payload = _result_to_json(res)
+
+        image_paths: list[str] = []
+        if isinstance(payload.get("image_paths"), list):
+            image_paths.extend([str(x) for x in payload.get("image_paths") if isinstance(x, str)])
+
+        # Watch mode: take a screenshot after any non-screenshot action.
+        if watch and action not in {"browser_take_screenshot"}:
+            try:
+                res2 = _call_tool("browser_take_screenshot", {"fullPage": bool(full_page)})
+                p2 = _result_to_json(res2)
+                if isinstance(p2.get("image_paths"), list):
+                    for p in p2["image_paths"]:
+                        if isinstance(p, str) and p and p not in image_paths:
+                            image_paths.append(p)
+            except Exception:
+                pass
+
+        out: JsonDict = {"ok": True, "action": action, "text": str(payload.get("text") or "").strip(), "image_paths": image_paths}
+        return json.dumps(out, ensure_ascii=False)
+
+    return _handler, _shutdown
+
+
+def web_fetch_tool_spec() -> JsonDict:
+    """Tool spec for fetching a web page (HTTP GET) with optional readability extraction."""
+
+    return {
+        "type": "function",
+        "name": "web_fetch",
+        "description": (
+            "Fetch a URL over HTTP(S) and return its text content (optionally extracting main content). "
+            "Use this when web_search results need deeper reading."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to fetch."},
+                "timeout_s": {"type": "number", "description": "Request timeout in seconds (optional)."},
+                "max_chars": {"type": "integer", "description": "Maximum characters to return (optional)."},
+                "readability": {"type": "boolean", "description": "If true, attempt to extract main article content."},
+                "cache_ttl_s": {"type": "number", "description": "Cache TTL in seconds (optional)."},
+                "no_cache": {"type": "boolean", "description": "If true, bypass cache (optional)."},
+                "user_agent": {"type": "string", "description": "Override user-agent (optional)."},
+                "max_redirects": {"type": "integer", "description": "Maximum redirects to follow (optional)."},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _safe_cache_key(url: str) -> str:
+    h = hashlib.sha256(url.encode("utf-8", errors="ignore")).hexdigest()
+    return h[:32]
+
+
+def _html_to_text_fallback(html_text: str, *, max_chars: int) -> str:
+    # Very small, dependency-free HTML->text fallback.
+    t = re.sub(r"(?is)<script.*?>.*?</script>", " ", html_text or "")
+    t = re.sub(r"(?is)<style.*?>.*?</style>", " ", t)
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    try:
+        import html as _html  # stdlib
+
+        t = _html.unescape(t)
+    except Exception:
+        pass
+    t = re.sub(r"[ \t\r\f\v]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = t.strip()
+    if len(t) > max_chars:
+        t = t[:max_chars]
+    return t
+
+
+def _readability_extract(html_text: str, *, max_chars: int) -> str:
+    # Prefer readability-lxml when available, else fallback.
+    try:
+        from readability import Document  # type: ignore[import-not-found]
+        import lxml.html  # type: ignore[import-not-found]
+
+        doc = Document(html_text or "")
+        summary_html = doc.summary(html_partial=True) or ""
+        root = lxml.html.fromstring(summary_html)
+        txt = root.text_content() or ""
+        txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt)
+        txt = txt.strip()
+        if len(txt) > max_chars:
+            txt = txt[:max_chars]
+        return txt
+    except Exception:
+        return _html_to_text_fallback(html_text or "", max_chars=max_chars)
+
+
+def make_web_fetch_handler(
+    *,
+    cache_dir: Path,
+    default_timeout_s: float = 20.0,
+    default_max_chars: int = 120_000,
+    default_cache_ttl_s: float = 30 * 60.0,
+    default_readability: bool = True,
+) -> FunctionHandler:
+    """Create a handler for `web_fetch`."""
+
+    cache_dir = Path(cache_dir).resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _handler(args: JsonDict) -> str:
+        url = args.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ToolError("url must be a non-empty string")
+        url = url.strip()
+
+        timeout_s = float(args.get("timeout_s", default_timeout_s))
+        max_chars = int(args.get("max_chars", default_max_chars))
+        readability = bool(args.get("readability", default_readability))
+        cache_ttl_s = float(args.get("cache_ttl_s", default_cache_ttl_s))
+        no_cache = bool(args.get("no_cache", False))
+        user_agent = args.get("user_agent")
+        max_redirects = int(args.get("max_redirects", 8))
+
+        if not (1.0 <= timeout_s <= 120.0):
+            raise ToolError("timeout_s must be between 1 and 120")
+        if not (1_000 <= max_chars <= 1_000_000):
+            raise ToolError("max_chars must be between 1000 and 1000000")
+        if not (0.0 <= cache_ttl_s <= 24 * 3600.0):
+            raise ToolError("cache_ttl_s must be between 0 and 86400")
+        if not (0 <= max_redirects <= 16):
+            raise ToolError("max_redirects must be between 0 and 16")
+        if user_agent is not None and not isinstance(user_agent, str):
+            raise ToolError("user_agent must be a string")
+
+        cache_key = _safe_cache_key(url)
+        cache_path = cache_dir / f"{cache_key}.json"
+        now = time.time()
+        if (not no_cache) and cache_ttl_s > 0 and cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                ts = float(cached.get("ts", 0.0))
+                if (now - ts) <= cache_ttl_s and isinstance(cached.get("result"), dict):
+                    res = dict(cached["result"])
+                    res["cached"] = True
+                    return json.dumps(res, ensure_ascii=False)
+            except Exception:
+                pass
+
+        try:
+            import httpx  # type: ignore[import-not-found]
+
+            headers = {
+                "User-Agent": (user_agent.strip() if isinstance(user_agent, str) and user_agent.strip() else "desktop-agent/1.0"),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+            }
+            with httpx.Client(
+                timeout=timeout_s,
+                follow_redirects=True,
+                headers=headers,
+                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                max_redirects=max_redirects,
+            ) as client:
+                r = client.get(url)
+                status = int(r.status_code)
+                final_url = str(r.url)
+                ctype = r.headers.get("content-type", "")
+                text = r.text if isinstance(r.text, str) else str(r.content.decode("utf-8", errors="replace"))
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}", "url": url}, ensure_ascii=False)
+
+        is_html = "text/html" in (ctype or "").lower()
+        if readability and is_html:
+            out_text = _readability_extract(text, max_chars=max_chars)
+        else:
+            out_text = text
+            if len(out_text) > max_chars:
+                out_text = out_text[:max_chars]
+
+        res: JsonDict = {
+            "ok": True,
+            "url": url,
+            "final_url": final_url,
+            "status_code": status,
+            "content_type": ctype,
+            "text": out_text,
+            "cached": False,
+            "truncated": len(out_text) >= max_chars,
+        }
+
+        if (not no_cache) and cache_ttl_s > 0:
+            try:
+                cache_path.write_text(json.dumps({"ts": now, "result": res}, ensure_ascii=False) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        return json.dumps(res, ensure_ascii=False)
+
+    return _handler
 
 
 def read_file_tool_spec() -> JsonDict:
@@ -2078,3 +2550,342 @@ def make_create_and_register_python_tool_handler(
         )
 
     return _handler
+
+
+# ---- Dev workspace tools (Python-only venv + pip + web preview) ----
+
+
+def workspace_info_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_info",
+        "description": "Get the current dev workspace root for this chat and whether its venv exists.",
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    }
+
+
+def workspace_write_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_write",
+        "description": "Write a UTF-8 text file inside the dev workspace (workspace-relative path only).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative path, e.g. index.html or src/app.py"},
+                "content": {"type": "string", "description": "Full file contents (UTF-8)."},
+            },
+            "required": ["path", "content"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_append_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_append",
+        "description": "Append UTF-8 text to a file inside the dev workspace (workspace-relative path only).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative path."},
+                "text": {"type": "string", "description": "Text to append."},
+            },
+            "required": ["path", "text"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_read_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_read",
+        "description": "Read a UTF-8 text file inside the dev workspace (workspace-relative path only).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer", "default": 1},
+                "max_lines": {"type": "integer", "default": 200},
+                "max_chars": {"type": "integer", "default": 20000},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_list_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_list",
+        "description": "List files under a workspace directory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "dir": {"type": "string", "default": ".", "description": "Workspace-relative directory, default '.'"},
+                "max_entries": {"type": "integer", "default": 200},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_create_venv_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_create_venv",
+        "description": "Create a Python venv at workspace/.venv (no-op if it already exists).",
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    }
+
+
+def workspace_pip_install_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_pip_install",
+        "description": "Install Python packages into the workspace venv using pip (requires user approval).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "packages": {"type": "array", "items": {"type": "string"}, "description": "e.g. ['numpy==2.2.2']"},
+                "timeout_s": {"type": "number", "default": 900},
+            },
+            "required": ["packages"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_run_python_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_run_python",
+        "description": "Run a Python script using the workspace venv interpreter.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "script_path": {"type": "string", "description": "Workspace-relative script path."},
+                "args": {"type": "array", "items": {"type": "string"}, "default": []},
+                "timeout_s": {"type": "number", "default": 60},
+            },
+            "required": ["script_path"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_http_server_start_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_http_server_start",
+        "description": "Start a static HTTP server for the workspace (python -m http.server).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "default": ".", "description": "Workspace-relative dir to serve."},
+                "port": {"type": "integer", "default": 8000},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    }
+
+
+def workspace_http_server_stop_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "workspace_http_server_stop",
+        "description": "Stop the workspace static HTTP server started previously.",
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+    }
+
+
+def make_workspace_handlers(
+    *,
+    repo_root: Path,
+    get_chat_id: Callable[[], str],
+    allow_workspace: Callable[[], bool],
+    allow_pip: Callable[[], bool],
+    allow_http_server: Callable[[], bool],
+    approve_pip: Callable[[str], bool],
+    log: Optional[Callable[[str], None]] = None,
+) -> dict[str, FunctionHandler]:
+    def _ws() -> Path:
+        return ws_ensure_workspace(repo_root=repo_root, chat_id=get_chat_id())
+
+    def _log(msg: str) -> None:
+        try:
+            if log is not None:
+                log(msg)
+        except Exception:
+            pass
+
+    def _disabled(name: str) -> str:
+        return json.dumps({"ok": False, "error": f"{name} disabled"})
+
+    def info(_: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        ws = _ws()
+        return json.dumps(
+            {
+                "ok": True,
+                "workspace_root": str(ws),
+                "venv_exists": bool(ws_venv_exists(ws)),
+                "venv_python": str(ws_venv_python_path(ws)),
+            }
+        )
+
+    def write(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        try:
+            p = ws_write_text(ws_root=_ws(), rel_path=str(args.get("path") or ""), content=str(args.get("content") or ""))
+            return json.dumps({"ok": True, "path": str(p)})
+        except WorkspaceError as e:
+            return json.dumps({"ok": False, "error": f"{e}"})
+
+    def append(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        try:
+            p = ws_append_text(ws_root=_ws(), rel_path=str(args.get("path") or ""), text=str(args.get("text") or ""))
+            return json.dumps({"ok": True, "path": str(p)})
+        except WorkspaceError as e:
+            return json.dumps({"ok": False, "error": f"{e}"})
+
+    def read(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        try:
+            txt = ws_read_text(
+                ws_root=_ws(),
+                rel_path=str(args.get("path") or ""),
+                start_line=int(args.get("start_line") or 1),
+                max_lines=int(args.get("max_lines") or 200),
+                max_chars=int(args.get("max_chars") or 20000),
+            )
+            return json.dumps({"ok": True, "text": txt})
+        except WorkspaceError as e:
+            return json.dumps({"ok": False, "error": f"{e}"})
+
+    def ls(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        try:
+            items = ws_list_dir(ws_root=_ws(), rel_dir=str(args.get("dir") or "."), max_entries=int(args.get("max_entries") or 200))
+            return json.dumps({"ok": True, "items": items})
+        except WorkspaceError as e:
+            return json.dumps({"ok": False, "error": f"{e}"})
+
+    def mkvenv(_: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        try:
+            py = ws_create_venv(ws_root=_ws())
+            return json.dumps({"ok": True, "venv_python": str(py)})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def pip_install(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        if not allow_pip():
+            return json.dumps({"ok": False, "error": "pip installs disabled"})
+        packages = args.get("packages")
+        if not isinstance(packages, list) or not packages:
+            return json.dumps({"ok": False, "error": "packages must be a non-empty array"})
+        pkgs = [str(x) for x in packages if str(x).strip()]
+        prompt = "Allow pip install into dev workspace venv?\n\n" + "\n".join(f"- {p}" for p in pkgs)
+        if not bool(approve_pip(prompt)):
+            return json.dumps({"ok": False, "error": "User did not approve pip install"})
+        timeout_s = float(args.get("timeout_s") or 900.0)
+        ws = _ws()
+        _log(f"pip_install_start packages={pkgs}")
+        try:
+            cp = ws_pip_install(ws_root=ws, packages=pkgs, timeout_s=timeout_s, log_path=(ws / "pip_install.log"))
+            out = (cp.stdout or "").strip()
+            if len(out) > 12000:
+                out = out[-12000:]
+            _log(f"pip_install_done code={cp.returncode}")
+            return json.dumps(
+                {
+                    "ok": cp.returncode == 0,
+                    "returncode": int(cp.returncode),
+                    "output": out,
+                    "log_path": str((ws / "pip_install.log").resolve()),
+                }
+            )
+        except Exception as e:  # noqa: BLE001
+            _log(f"pip_install_error error={type(e).__name__}: {e}")
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def run_py(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        script_path = str(args.get("script_path") or "")
+        if not script_path:
+            return json.dumps({"ok": False, "error": "script_path required"})
+        argv = args.get("args")
+        if argv is None:
+            argv = []
+        if not isinstance(argv, list):
+            return json.dumps({"ok": False, "error": "args must be an array"})
+        timeout_s = float(args.get("timeout_s") or 60.0)
+        ws = _ws()
+        try:
+            # Ensure script exists inside workspace.
+            rp = (ws / Path(script_path)).resolve()
+            if not str(rp).startswith(str(ws)) or (not rp.exists()):
+                return json.dumps({"ok": False, "error": "script_path must exist inside workspace"})
+            cp = ws_run_venv_python(ws_root=ws, args=[str(rp), *[str(x) for x in argv]], timeout_s=timeout_s)
+            out = (cp.stdout or "").strip()
+            if len(out) > 12000:
+                out = out[-12000:]
+            return json.dumps({"ok": cp.returncode == 0, "returncode": int(cp.returncode), "output": out})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def server_start(args: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        if not allow_http_server():
+            return json.dumps({"ok": False, "error": "http server disabled"})
+        ws = _ws()
+        try:
+            root = str(args.get("root") or ".")
+            port = int(args.get("port") or 8000)
+            st = ws_http_server_start(ws_root=ws, port=port, root=root, use_venv=True)
+            return json.dumps(
+                {"ok": True, "port": int(st.port), "pid": int(st.pid), "url": f"http://127.0.0.1:{int(st.port)}/"}
+            )
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def server_stop(_: JsonDict) -> str:
+        if not allow_workspace():
+            return _disabled("workspace")
+        if not allow_http_server():
+            return json.dumps({"ok": False, "error": "http server disabled"})
+        try:
+            ok = bool(ws_http_server_stop(ws_root=_ws()))
+            return json.dumps({"ok": True, "stopped": ok})
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "workspace_info": info,
+        "workspace_write": write,
+        "workspace_append": append,
+        "workspace_read": read,
+        "workspace_list": ls,
+        "workspace_create_venv": mkvenv,
+        "workspace_pip_install": pip_install,
+        "workspace_run_python": run_py,
+        "workspace_http_server_start": server_start,
+        "workspace_http_server_stop": server_stop,
+    }

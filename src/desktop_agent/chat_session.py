@@ -13,7 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import os
 import queue
@@ -36,15 +36,19 @@ from .tools import (
     append_file_tool_spec,
     create_and_register_python_tool_spec,
     get_system_prompt_tool_spec,
+    make_workspace_handlers,
     make_append_file_handler,
     make_add_to_system_prompt_handler,
     make_create_and_register_python_tool_handler,
     make_get_system_prompt_handler,
+    make_web_fetch_handler,
     make_python_sandbox_handler,
+    make_playwright_browser_handler,
     make_render_plot_handler,
     make_create_and_register_analysis_tool_handler,
     make_read_file_handler,
     make_set_system_prompt_handler,
+    playwright_browser_tool_spec,
     self_tool_creator_handler,
     self_tool_creator_tool_spec,
     python_sandbox_tool_spec,
@@ -54,7 +58,18 @@ from .tools import (
     run_responses_with_function_tools,
     set_system_prompt_tool_spec,
     make_write_file_handler,
+    web_fetch_tool_spec,
     write_file_tool_spec,
+    workspace_append_tool_spec,
+    workspace_create_venv_tool_spec,
+    workspace_http_server_start_tool_spec,
+    workspace_http_server_stop_tool_spec,
+    workspace_info_tool_spec,
+    workspace_list_tool_spec,
+    workspace_pip_install_tool_spec,
+    workspace_read_tool_spec,
+    workspace_run_python_tool_spec,
+    workspace_write_tool_spec,
     submodel_batch_tool_spec,
     submodel_close_tool_spec,
     submodel_list_tool_spec,
@@ -243,6 +258,11 @@ class ChatConfig:
     model: str = DEFAULT_MODEL
     enable_web_search: bool = True
     web_search_context_size: str = "medium"  # low|medium|high
+    enable_web_fetch: bool = True
+    web_fetch_timeout_s: float = 20.0
+    web_fetch_max_chars: int = 120_000
+    web_fetch_cache_ttl_s: float = 30 * 60.0
+    web_fetch_readability: bool = True
     enable_file_search: bool = False
     file_search_vector_store_ids: list[str] = field(default_factory=list)
     file_search_max_num_results: int | None = None
@@ -257,6 +277,7 @@ class ChatConfig:
     allow_model_create_tools: bool = True
     allow_model_propose_tools: bool = True
     allow_read_file: bool = True
+    allow_web_fetch: bool = True
     allow_write_files: bool = False
     hide_think: bool = False
     allow_python_sandbox: bool = True
@@ -267,6 +288,21 @@ class ChatConfig:
     max_submodel_depth: int = 1
     submodel_depth: int = 0
     submodel_ping_s: float = 2.0
+    enable_playwright_browser: bool = False
+    allow_playwright_browser: bool = False
+    playwright_headless: bool = True
+    # When enabled, automatically take a screenshot after each playwright action
+    # (best-effort). This makes the UX "feel" like something is happening even
+    # when the browser is headless.
+    playwright_watch_mode: bool = True
+    playwright_screenshot_full_page: bool = False
+    allow_playwright_eval: bool = False
+    use_agents_sdk: bool = False
+    enable_telegram_bridge: bool = False
+    telegram_send_tool_events: bool = False
+    enable_dev_workspace: bool = False
+    allow_dev_pip_install: bool = False
+    allow_dev_http_server: bool = False
 
 
 @dataclass
@@ -294,6 +330,8 @@ class ChatSession:
         self._submodel_accept_thread: threading.Thread | None = None
         self._submodel_ping_thread: threading.Thread | None = None
         self._submodel_stop = threading.Event()
+        self._playwright_shutdown: Optional[callable] = None
+        self._pip_approver: Callable[[str], bool] = lambda prompt: False
 
         self.registry = ToolRegistry(tools={}, handlers={})
         self._install_default_tools()
@@ -329,6 +367,9 @@ class ChatSession:
         self._submodels = {}
         self._stop_submodel_threads()
         self._start_submodel_threads()
+
+    def set_pip_approver(self, fn: Callable[[str], bool]) -> None:
+        self._pip_approver = fn
 
     # ---- tools ----
 
@@ -369,6 +410,58 @@ class ChatSession:
             return py_handler(args)
 
         self.registry.add(tool_spec=python_sandbox_tool_spec(), handler=gated_py)
+
+        # Web fetch tool (HTTP fetch + optional readability + caching).
+        web_fetch_handler = make_web_fetch_handler(
+            cache_dir=(self.cfg.tool_base_dir / "chat_history" / "web_cache"),
+            default_timeout_s=float(self.cfg.web_fetch_timeout_s),
+            default_max_chars=int(self.cfg.web_fetch_max_chars),
+            default_cache_ttl_s=float(self.cfg.web_fetch_cache_ttl_s),
+            default_readability=bool(self.cfg.web_fetch_readability),
+        )
+
+        def gated_web_fetch(args: JsonDict) -> str:
+            if not self.cfg.enable_web_fetch:
+                return json.dumps({"ok": False, "error": "web_fetch disabled"})
+            if not self.cfg.allow_web_fetch:
+                return json.dumps({"ok": False, "error": "web_fetch disabled"})
+            return web_fetch_handler(args)
+
+        self.registry.add(tool_spec=web_fetch_tool_spec(), handler=gated_web_fetch)
+
+        # Playwright browser via MCP (optional, gated).
+        pw_cmd = ["cmd.exe", "/c", "npx", "-y", "@playwright/mcp@latest"]
+        if bool(self.cfg.playwright_headless):
+            pw_cmd += ["--headless"]
+        image_out_dir = (self.cfg.tool_base_dir / "chat_history" / "browser").resolve()
+        pw_handler, pw_shutdown = make_playwright_browser_handler(
+            cmd=pw_cmd,
+            repo_root=self.cfg.tool_base_dir,
+            image_out_dir=image_out_dir,
+            # First-time browser installs (chromium download) can take a while.
+            call_timeout_s=600.0,
+        )
+        self._playwright_shutdown = pw_shutdown
+
+        def gated_pw(args: JsonDict) -> str:
+            if not self.cfg.enable_playwright_browser:
+                return json.dumps({"ok": False, "error": "playwright_browser disabled"})
+            if not self.cfg.allow_playwright_browser:
+                return json.dumps({"ok": False, "error": "playwright_browser disabled"})
+            # Enforce extra gating for evaluation/run_code.
+            try:
+                action = str(args.get("action") or "")
+            except Exception:
+                action = ""
+            if action in {"browser_evaluate", "browser_run_code"} and (not bool(self.cfg.allow_playwright_eval)):
+                return json.dumps({"ok": False, "error": f"{action} disabled"})
+            # Inject watch-mode settings from config (UI toggle).
+            merged = dict(args)
+            merged.setdefault("watch", bool(self.cfg.playwright_watch_mode))
+            merged.setdefault("screenshot_full_page", bool(self.cfg.playwright_screenshot_full_page))
+            return pw_handler(merged)
+
+        self.registry.add(tool_spec=playwright_browser_tool_spec(), handler=gated_pw)
 
         # Visualization helper (alias around python_sandbox for plots/graphs)
         render_plot = make_render_plot_handler(python_sandbox_handler=gated_py)
@@ -454,6 +547,28 @@ class ChatSession:
             return create_handler(args)
 
         self.registry.add(tool_spec=create_and_register_python_tool_spec(), handler=gated_create)
+
+        # ---- Dev workspace tools (Python-only venv + pip + static server) ----
+        ws_handlers = make_workspace_handlers(
+            repo_root=self.cfg.tool_base_dir,
+            get_chat_id=lambda: str(self.chat_id),
+            allow_workspace=lambda: bool(getattr(self.cfg, "enable_dev_workspace", False)),
+            allow_pip=lambda: bool(getattr(self.cfg, "allow_dev_pip_install", False)),
+            allow_http_server=lambda: bool(getattr(self.cfg, "allow_dev_http_server", False)),
+            approve_pip=lambda prompt: bool(self._pip_approver(prompt)),
+            log=lambda m: _LOG.info("dev_workspace %s", m),
+        )
+
+        self.registry.add(tool_spec=workspace_info_tool_spec(), handler=ws_handlers["workspace_info"])
+        self.registry.add(tool_spec=workspace_write_tool_spec(), handler=ws_handlers["workspace_write"])
+        self.registry.add(tool_spec=workspace_append_tool_spec(), handler=ws_handlers["workspace_append"])
+        self.registry.add(tool_spec=workspace_read_tool_spec(), handler=ws_handlers["workspace_read"])
+        self.registry.add(tool_spec=workspace_list_tool_spec(), handler=ws_handlers["workspace_list"])
+        self.registry.add(tool_spec=workspace_create_venv_tool_spec(), handler=ws_handlers["workspace_create_venv"])
+        self.registry.add(tool_spec=workspace_pip_install_tool_spec(), handler=ws_handlers["workspace_pip_install"])
+        self.registry.add(tool_spec=workspace_run_python_tool_spec(), handler=ws_handlers["workspace_run_python"])
+        self.registry.add(tool_spec=workspace_http_server_start_tool_spec(), handler=ws_handlers["workspace_http_server_start"])
+        self.registry.add(tool_spec=workspace_http_server_stop_tool_spec(), handler=ws_handlers["workspace_http_server_stop"])
 
     def _extra_tools(self) -> list[JsonDict]:
         out: list[JsonDict] = []
@@ -754,6 +869,22 @@ class ChatSession:
             "system_prompt": self._system_prompt,
             "enable_web_search": bool(self.cfg.enable_web_search),
             "web_search_context_size": str(self.cfg.web_search_context_size),
+            "enable_web_fetch": bool(self.cfg.enable_web_fetch),
+            "web_fetch_timeout_s": float(self.cfg.web_fetch_timeout_s),
+            "web_fetch_max_chars": int(self.cfg.web_fetch_max_chars),
+            "web_fetch_cache_ttl_s": float(self.cfg.web_fetch_cache_ttl_s),
+            "web_fetch_readability": bool(self.cfg.web_fetch_readability),
+            "enable_playwright_browser": bool(self.cfg.enable_playwright_browser),
+            "playwright_headless": bool(self.cfg.playwright_headless),
+            "playwright_watch_mode": bool(self.cfg.playwright_watch_mode),
+            "playwright_screenshot_full_page": bool(self.cfg.playwright_screenshot_full_page),
+            "allow_playwright_eval": bool(self.cfg.allow_playwright_eval),
+            "use_agents_sdk": bool(self.cfg.use_agents_sdk),
+            "enable_telegram_bridge": bool(getattr(self.cfg, "enable_telegram_bridge", False)),
+            "telegram_send_tool_events": bool(getattr(self.cfg, "telegram_send_tool_events", False)),
+            "enable_dev_workspace": bool(getattr(self.cfg, "enable_dev_workspace", False)),
+            "allow_dev_pip_install": bool(getattr(self.cfg, "allow_dev_pip_install", False)),
+            "allow_dev_http_server": bool(getattr(self.cfg, "allow_dev_http_server", False)),
             "enable_file_search": bool(self.cfg.enable_file_search),
             "file_search_vector_store_ids": list(self.cfg.file_search_vector_store_ids),
             "file_search_max_num_results": self.cfg.file_search_max_num_results,
@@ -771,6 +902,37 @@ class ChatSession:
         self.cfg.model = str(rec.get("model") or self.cfg.model)
         self.cfg.enable_web_search = bool(rec.get("enable_web_search", self.cfg.enable_web_search))
         self.cfg.web_search_context_size = str(rec.get("web_search_context_size") or self.cfg.web_search_context_size)
+        self.cfg.enable_web_fetch = bool(rec.get("enable_web_fetch", self.cfg.enable_web_fetch))
+        try:
+            self.cfg.web_fetch_timeout_s = float(rec.get("web_fetch_timeout_s", self.cfg.web_fetch_timeout_s))
+        except Exception:
+            pass
+        try:
+            self.cfg.web_fetch_max_chars = int(rec.get("web_fetch_max_chars", self.cfg.web_fetch_max_chars))
+        except Exception:
+            pass
+        try:
+            self.cfg.web_fetch_cache_ttl_s = float(rec.get("web_fetch_cache_ttl_s", self.cfg.web_fetch_cache_ttl_s))
+        except Exception:
+            pass
+        self.cfg.web_fetch_readability = bool(rec.get("web_fetch_readability", self.cfg.web_fetch_readability))
+        self.cfg.enable_playwright_browser = bool(rec.get("enable_playwright_browser", self.cfg.enable_playwright_browser))
+        self.cfg.playwright_headless = bool(rec.get("playwright_headless", self.cfg.playwright_headless))
+        self.cfg.playwright_watch_mode = bool(rec.get("playwright_watch_mode", self.cfg.playwright_watch_mode))
+        self.cfg.playwright_screenshot_full_page = bool(
+            rec.get("playwright_screenshot_full_page", self.cfg.playwright_screenshot_full_page)
+        )
+        self.cfg.allow_playwright_eval = bool(rec.get("allow_playwright_eval", self.cfg.allow_playwright_eval))
+        self.cfg.use_agents_sdk = bool(rec.get("use_agents_sdk", self.cfg.use_agents_sdk))
+        self.cfg.enable_telegram_bridge = bool(rec.get("enable_telegram_bridge", getattr(self.cfg, "enable_telegram_bridge", False)))
+        self.cfg.telegram_send_tool_events = bool(
+            rec.get("telegram_send_tool_events", getattr(self.cfg, "telegram_send_tool_events", False))
+        )
+        self.cfg.enable_dev_workspace = bool(rec.get("enable_dev_workspace", getattr(self.cfg, "enable_dev_workspace", False)))
+        self.cfg.allow_dev_pip_install = bool(rec.get("allow_dev_pip_install", getattr(self.cfg, "allow_dev_pip_install", False)))
+        self.cfg.allow_dev_http_server = bool(
+            rec.get("allow_dev_http_server", getattr(self.cfg, "allow_dev_http_server", False))
+        )
         self.cfg.enable_file_search = bool(rec.get("enable_file_search", self.cfg.enable_file_search))
         vs = rec.get("file_search_vector_store_ids")
         if isinstance(vs, list):
@@ -923,7 +1085,21 @@ class ChatSession:
     def shutdown(self) -> None:
         """Terminate submodel workers and stop background threads."""
 
+        try:
+            if self._playwright_shutdown is not None:
+                self._playwright_shutdown()
+        except Exception:
+            pass
         self._stop_submodel_threads()
+
+    def restart_playwright(self) -> None:
+        """Restart the Playwright MCP server (best-effort)."""
+
+        try:
+            if self._playwright_shutdown is not None:
+                self._playwright_shutdown()
+        except Exception:
+            pass
 
     def _spawn_submodel(self, *, title: str, system_prompt: str, model: str, allow_nested: bool) -> "_SubprocessSubmodel":
         if not self._can_spawn_submodel():

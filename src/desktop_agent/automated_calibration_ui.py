@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .automated_calibration_config import build_analysis_system_prompt, default_run_config_path, example_run_config_path, load_run_config
+from .automated_calibration_config import (
+    build_analysis_system_prompt,
+    default_run_config_path,
+    example_run_config_path,
+    load_run_config,
+    save_run_config,
+)
 from .automated_calibration_ops import (
     archive_dir,
     connect_wifi_windows,
@@ -35,6 +45,17 @@ def _load_qss() -> str:
         return p.read_text(encoding="utf-8")
     except Exception:
         return ""
+
+
+def _http_get_json(url: str, *, timeout_s: float = 5.0) -> object:
+    req = Request(
+        url=url,
+        method="GET",
+        headers={"Accept": "application/json"},
+    )
+    with urlopen(req, timeout=timeout_s) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8"))
 
 
 class _Signals(QtCore.QObject):
@@ -253,6 +274,13 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
             host = self._pick_ssh_host()
             user = self._cfg.pi_ssh.user
 
+            # Pull the current Z_EKF config from the webapp while we're still on the Pi AP.
+            try:
+                self._pull_and_store_z_ekf_config(webapp_hosts=[host, self._cfg.pi_ssh.fallback_host])
+            except Exception as e:
+                # Best-effort only; logs are still valuable even if config fetch fails.
+                self._log(f"WARNING: Failed to fetch /api/z_ekf/config: {type(e).__name__}: {e}")
+
             # Stop the webapp SSH session (best-effort). It may terminate the webapp if it runs in foreground.
             if self._webapp_proc is not None and self._webapp_proc.poll() is None:
                 try:
@@ -322,6 +350,89 @@ class CalibrationRunnerWindow(QtWidgets.QMainWindow):
             self._log("Remote logs deleted.")
 
         self._run_bg("Pulling logs…", work)
+
+    def _pull_and_store_z_ekf_config(self, *, webapp_hosts: list[str]) -> None:
+        hosts = [h.strip() for h in webapp_hosts if isinstance(h, str) and h.strip()]
+        seen: set[str] = set()
+        uniq_hosts: list[str] = []
+        for h in hosts:
+            if h not in seen:
+                uniq_hosts.append(h)
+                seen.add(h)
+        if not uniq_hosts:
+            raise RuntimeError("No webapp host configured")
+
+        last_err: Exception | None = None
+        payload: object | None = None
+        used_host: str | None = None
+
+        for h in uniq_hosts:
+            url = f"http://{h}:5000/api/z_ekf/config"
+            try:
+                self._log(f"Fetching Z_EKF config: {url}")
+                payload = _http_get_json(url, timeout_s=5.0)
+                used_host = h
+                break
+            except (URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as e:
+                last_err = e
+
+        if used_host is None or payload is None:
+            raise RuntimeError(f"Failed to fetch Z_EKF config from hosts {uniq_hosts!r}: {last_err}")
+
+        if isinstance(payload, dict) and isinstance(payload.get("config"), dict):
+            payload = payload["config"]
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Expected JSON object from /api/z_ekf/config, got {type(payload).__name__}")
+
+        target_path = self._config_path
+        if str(target_path).endswith("run_config.example.json"):
+            target_path = default_run_config_path()
+            if not target_path.exists():
+                target_path.write_text(self._config_path.read_text(encoding="utf-8"), encoding="utf-8")
+            self._log(f"Writing fetched params to: {target_path}")
+
+        raw = json.loads(Path(target_path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise RuntimeError("run_config.json must be an object")
+        analysis = raw.get("analysis") or {}
+        if not isinstance(analysis, dict):
+            analysis = {}
+
+        block_start = "----- BEGIN AUTO Z_EKF CONFIG -----"
+        block_end = "----- END AUTO Z_EKF CONFIG -----"
+        fetched_utc = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        config_json = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True)
+        block = (
+            f"{block_start}\n"
+            f"source: http://{used_host}:5000/api/z_ekf/config\n"
+            f"fetched_utc: {fetched_utc}\n"
+            f"config_json:\n{config_json}\n"
+            f"{block_end}"
+        )
+
+        existing_extra = analysis.get("extra_context")
+        if not isinstance(existing_extra, str):
+            existing_extra = ""
+
+        if block_start in existing_extra and block_end in existing_extra:
+            s = existing_extra.find(block_start)
+            e = existing_extra.find(block_end, s)
+            if e >= 0:
+                e2 = e + len(block_end)
+                before = existing_extra[:s].rstrip()
+                after = existing_extra[e2:].lstrip()
+                analysis["extra_context"] = (before + "\n\n" if before else "") + block + ("\n\n" + after if after else "\n")
+            else:
+                analysis["extra_context"] = (existing_extra.strip() + "\n\n" if existing_extra.strip() else "") + block + "\n"
+        else:
+            analysis["extra_context"] = (existing_extra.strip() + "\n\n" if existing_extra.strip() else "") + block + "\n"
+
+        raw["analysis"] = analysis
+        save_run_config(target_path, raw)
+
+        self._config_path = Path(target_path)
+        self._cfg = load_run_config(self._config_path)
+        self._log("Saved Z_EKF config into analysis.extra_context")
 
     def _choose_wifi_dialog(self, *, title: str) -> tuple[str | None, str | None]:
         dlg = QtWidgets.QDialog(self)

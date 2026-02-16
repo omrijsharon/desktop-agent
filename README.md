@@ -47,6 +47,15 @@ Notes:
 pytest -q
 ```
 
+## Run UIs
+
+### Browser Helper UI (Playwright web automation)
+
+From repo root (PowerShell):
+
+- `.\.venv\Scripts\python.exe -m desktop_agent.browser_helper_ui`
+- or `.\.venv\Scripts\python.exe scripts\browser_helper_ui.py`
+
 ## Tests
 
 ### PowerShell (recommended)

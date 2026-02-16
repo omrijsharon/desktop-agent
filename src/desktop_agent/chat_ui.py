@@ -17,6 +17,8 @@ import sys
 import time
 import logging
 import traceback
+import threading
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,13 @@ from .chat_store import delete_chat, list_chats, load_chat, new_chat_id, prune_e
 from .config import DEFAULT_MODEL, SUPPORTED_MODELS, load_config
 from .agent_hub import AgentHub, AgentHubError, load_agents_config, save_agents_config
 from .tools import create_peer_agent_tool_spec, make_create_peer_agent_handler
+from .agent_sdk import AgentsSdkSession
+from .agent_sdk.runner import make_runner
+from .telegram_ipc import ensure_telegram_dirs, read_inbox_message, safe_list_json_files, write_outbox_message
+from .ui_prefs import apply_overrides as _apply_prefs_overrides
+from .ui_prefs import dataclass_to_json_dict as _prefs_dataclass_to_dict
+from .ui_prefs import load_defaults as _prefs_load_defaults
+from .ui_prefs import save_defaults as _prefs_save_defaults
 
 
 _THINK_BLOCK_RE = re.compile(r"(?is)<think>.*?</think>")
@@ -219,6 +228,7 @@ class _Signals(QtCore.QObject):
     set_busy = QtCore.Signal(bool)
     set_status = QtCore.Signal(str)
     set_tokens = QtCore.Signal(str)
+    pip_approval_request = QtCore.Signal(str, str)  # req_id, prompt
 
 
 @dataclass(frozen=True)
@@ -335,14 +345,25 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._signals = _Signals()
         self._signals.append_user.connect(lambda t: self._append_message(t, kind="user"))
         self._signals.append_assistant.connect(lambda t: self._append_message(t, kind="assistant"))
-        self._signals.append_tool.connect(lambda t: self._append_message(t, kind="tool"))
+        self._signals.append_tool.connect(self._on_tool_text)
         self._signals.set_busy.connect(self._set_busy)
         self._signals.set_status.connect(self._set_status)
         self._signals.set_tokens.connect(self._set_tokens)
+        self._signals.pip_approval_request.connect(self._on_pip_approval_request)
 
         self._session = self._make_session()
         self._show_tool_events = True
         self._hide_think = False
+        # Restore display prefs (best-effort) before building the controls UI.
+        try:
+            d = _prefs_load_defaults(_repo_root())
+            ui = d.get("ui")
+            if isinstance(ui, dict):
+                self._show_tool_events = bool(ui.get("show_tool_events", self._show_tool_events))
+                self._hide_think = bool(ui.get("hide_think", self._hide_think))
+                self._session.cfg.hide_think = bool(self._hide_think)
+        except Exception:
+            pass
         self._workers: set[_Worker] = set()
         self._bubbles: list[Bubble] = []
         self._title_wrap: Optional[QtWidgets.QWidget] = None
@@ -351,7 +372,7 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._switching_chat: bool = False
         self._active_submodel_id: str | None = None
         self._active_agent_id: str = str(self._session.chat_id)
-        self._hub = AgentHub(base_config=self._session.cfg, make_session=self._instantiate_session, repo_root=self._store_root)
+        self._hub = AgentHub(base_config=self._session.cfg, make_session=self._instantiate_session_any, repo_root=self._store_root)
         self._hub.set_main(agent_id=str(self._session.chat_id), name="Main", session=self._session)
         # User-gated arming window for the main agent to create same-level agents.
         self._create_peer_armed_until: float = 0.0
@@ -380,6 +401,11 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._refresh_submodel_list()
         self._set_tokens(self._session.usage_ratio_text())
         self._start_mention_timer()
+        self._telegram_timer = None
+        self._telegram_pending = []
+        self._pip_pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._apply_pip_approver()
+        self._apply_telegram_bridge_state()
 
         _LOG.info("ui_ready chat_id=%s model=%s", str(self._active_chat_id), str(self._session.cfg.model))
 
@@ -397,16 +423,94 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._mention_list: QtWidgets.QListWidget | None = None
         self._mention_all_names: list[str] = []
         self._mention_timer: QtCore.QTimer | None = None
+        self._telegram_timer: QtCore.QTimer | None = None
+        self._telegram_pending: list[tuple[str, str]] = []  # (from_name, text)
 
     def exec(self) -> int:
         self.show()
         return int(self._app.exec())
 
+    # ---- pip approvals (dev workspace) ----
+
+    def _apply_pip_approver(self) -> None:
+        """Ensure all agent sessions use the UI approval callback."""
+
+        try:
+            self._session.set_pip_approver(self._pip_approver)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            for a in self._hub.list_agents():
+                try:
+                    a.session.set_pip_approver(self._pip_approver)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _pip_approver(self, prompt: str) -> bool:
+        """Thread-safe approval callback used by workspace_pip_install."""
+
+        req_id = uuid.uuid4().hex[:12]
+        ev = threading.Event()
+        box: dict[str, Any] = {"result": False, "prompt": str(prompt or "")}
+        self._pip_pending[req_id] = (ev, box)
+        self._signals.pip_approval_request.emit(req_id, box["prompt"])
+        # Wait (up to 10 minutes) for user input.
+        ev.wait(timeout=10 * 60.0)
+        try:
+            return bool(box.get("result"))
+        finally:
+            self._pip_pending.pop(req_id, None)
+
+    def _on_pip_approval_request(self, req_id: str, prompt: str) -> None:
+        try:
+            it = self._pip_pending.get(str(req_id))
+            if it is None:
+                return
+            ev, box = it
+            msg = QtWidgets.QMessageBox(self)
+            msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            msg.setWindowTitle("Approve pip install")
+            msg.setText("A tool request wants to run pip install in the dev workspace venv.")
+            msg.setInformativeText(str(prompt or ""))
+            msg.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+            res = msg.exec()
+            box["result"] = res == int(QtWidgets.QMessageBox.StandardButton.Yes)
+            ev.set()
+        except Exception:
+            try:
+                it = self._pip_pending.get(str(req_id))
+                if it is not None:
+                    it[0].set()
+            except Exception:
+                pass
+
     # ---- session ----
 
     def _instantiate_session(self, cfg: ChatConfig) -> ChatSession:
         app_cfg = load_config()
-        return ChatSession(api_key=app_cfg.openai_api_key, config=cfg)
+        s = ChatSession(api_key=app_cfg.openai_api_key, config=cfg)
+        try:
+            s.set_pip_approver(self._pip_approver)
+        except Exception:
+            pass
+        return s
+
+    def _instantiate_agents_sdk_session(self, cfg: ChatConfig) -> AgentsSdkSession:
+        app_cfg = load_config()
+        s = AgentsSdkSession(api_key=app_cfg.openai_api_key, config=cfg)
+        try:
+            s.set_pip_approver(self._pip_approver)
+        except Exception:
+            pass
+        return s
+
+    def _instantiate_session_any(self, cfg: ChatConfig) -> Any:
+        if bool(getattr(cfg, "use_agents_sdk", False)):
+            return self._instantiate_agents_sdk_session(cfg)
+        return self._instantiate_session(cfg)
 
     def _make_session(self) -> ChatSession:
         app_cfg = load_config()
@@ -433,6 +537,16 @@ class ChatWindow(QtWidgets.QMainWindow):
             allow_read_file=True,
             hide_think=False,
         )
+
+        # Apply persisted UI defaults (best-effort).
+        try:
+            d = _prefs_load_defaults(_repo_root())
+            cfg_over = d.get("chat_config")
+            if isinstance(cfg_over, dict):
+                _apply_prefs_overrides(ccfg, cfg_over)
+        except Exception:
+            pass
+
         s = ChatSession(api_key=app_cfg.openai_api_key, config=ccfg)
         # Default system prompt: a chatty but tool-aware assistant.
         s.set_system_prompt(
@@ -444,6 +558,57 @@ class ChatWindow(QtWidgets.QMainWindow):
             "Only then call create_peer_agent.\n"
         )
         return s
+
+    def _persist_ui_defaults(self) -> None:
+        """Persist current session config so tool settings survive restarts."""
+
+        try:
+            data: dict[str, Any] = {}
+            data["chat_config"] = _prefs_dataclass_to_dict(self._session.cfg)
+            data["ui"] = {
+                "show_tool_events": bool(self._show_tool_events),
+                "hide_think": bool(self._hide_think),
+            }
+            _prefs_save_defaults(_repo_root(), data)
+        except Exception:
+            pass
+
+    def _switch_main_session_engine(self, *, use_agents_sdk: bool) -> None:
+        """Switch the main chat engine between legacy ChatSession and AgentsSdkSession."""
+
+        try:
+            rec = self._session.to_record()
+        except Exception:
+            rec = {}
+
+        # Persist current chat before switching.
+        try:
+            self._persist_current_chat()
+        except Exception:
+            pass
+
+        # Keep the existing chat_id/title/system prompt.
+        cfg = ChatConfig(**vars(self._session.cfg))
+        cfg.use_agents_sdk = bool(use_agents_sdk)
+        sess = self._instantiate_session_any(cfg)
+        try:
+            if isinstance(rec, dict) and rec:
+                sess.load_record(rec)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        self._session = sess  # type: ignore[assignment]
+        self._active_chat_id = str(getattr(self._session, "chat_id", self._active_chat_id))
+
+        # Recreate hub so prompts + tools reflect the new session object.
+        self._hub = AgentHub(base_config=self._session.cfg, make_session=self._instantiate_session_any, repo_root=self._store_root)
+        self._hub.set_main(agent_id=str(self._active_chat_id), name="Main", session=self._session)
+        self._create_peer_armed_until = 0.0
+        try:
+            self._register_create_peer_agent_tool()
+        except Exception:
+            pass
+        self._apply_telegram_bridge_state()
 
     def _register_create_peer_agent_tool(self) -> None:
         """Register a UI-only tool that lets Main create same-level agents (friends).
@@ -657,6 +822,12 @@ class ChatWindow(QtWidgets.QMainWindow):
         send_row.setSpacing(8)
         send_row.addWidget(self._btn_send, 1)
 
+        self._btn_stop = QtWidgets.QPushButton("Stop")
+        self._btn_stop.setObjectName("btn_ghost")
+        self._btn_stop.setToolTip("Interrupt the current response and pause auto-continue.")
+        self._btn_stop.clicked.connect(self._on_stop_clicked)
+        send_row.addWidget(self._btn_stop, 0)
+
         self._btn_skip = QtWidgets.QPushButton("Skip")
         self._btn_skip.setCheckable(True)
         self._btn_skip.setObjectName("btn_toggle")
@@ -843,8 +1014,23 @@ class ChatWindow(QtWidgets.QMainWindow):
         # Keep Send/Input enabled so the user can interrupt by sending.
         self._model_combo.setEnabled(not busy)
         self._btn_system.setEnabled(not busy)
+        try:
+            self._btn_stop.setEnabled(True)
+        except Exception:
+            pass
         self._set_status("Thinking…" if busy else "")
         _LOG.info("busy=%s chat_id=%s model=%s", bool(busy), str(self._active_chat_id), str(self._session.cfg.model))
+
+    def _on_stop_clicked(self) -> None:
+        # Interrupt current generation and pause auto-continue.
+        try:
+            if self._btn_skip.isChecked():
+                self._btn_skip.setChecked(False)
+        except Exception:
+            pass
+        self._skip_mode = False
+        self._interrupt_all_workers()
+        self._append_message("Stopped (interrupted current response).", kind="tool")
 
     def _on_skip_toggled(self, on: bool) -> None:
         self._skip_mode = bool(on)
@@ -1334,6 +1520,7 @@ class ChatWindow(QtWidgets.QMainWindow):
             self._session.cfg.max_tool_calls = int(mtc.value())
             self._append_message("Generation settings updated.", kind="tool")
             self._set_tokens(self._session.usage_ratio_text())
+            self._persist_ui_defaults()
 
         btn_apply_gen = QtWidgets.QPushButton("Apply generation settings")
         btn_apply_gen.setObjectName("btn_primary")
@@ -1344,9 +1531,22 @@ class ChatWindow(QtWidgets.QMainWindow):
 
         # --- Tools tab ---
         tools_tab = QtWidgets.QWidget()
-        tl = QtWidgets.QFormLayout(tools_tab)
-        tl.setContentsMargins(12, 12, 12, 12)
+        tools_outer = QtWidgets.QVBoxLayout(tools_tab)
+        tools_outer.setContentsMargins(12, 12, 12, 12)
+        tools_outer.setSpacing(10)
+
+        # Tools list can get long; make it scrollable while keeping the Apply button reachable.
+        tools_scroll = QtWidgets.QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        tools_scroll.setObjectName("controls_tools_scroll")
+
+        tools_inner = QtWidgets.QWidget()
+        tl = QtWidgets.QFormLayout(tools_inner)
+        tl.setContentsMargins(0, 0, 0, 0)
         tl.setSpacing(10)
+        tools_scroll.setWidget(tools_inner)
+        tools_outer.addWidget(tools_scroll, 1)
 
         chk_web = QtWidgets.QCheckBox("Enable web search")
         chk_web.setChecked(bool(self._session.cfg.enable_web_search))
@@ -1356,6 +1556,28 @@ class ChatWindow(QtWidgets.QMainWindow):
         i = ctx.findText(str(self._session.cfg.web_search_context_size))
         if i >= 0:
             ctx.setCurrentIndex(i)
+
+        chk_fetch = QtWidgets.QCheckBox("Enable web fetch (read pages)")
+        chk_fetch.setChecked(bool(getattr(self._session.cfg, "enable_web_fetch", True)))
+
+        fetch_readability = QtWidgets.QCheckBox("Web fetch: readability extraction")
+        fetch_readability.setChecked(bool(getattr(self._session.cfg, "web_fetch_readability", True)))
+
+        fetch_timeout = QtWidgets.QDoubleSpinBox()
+        fetch_timeout.setRange(1.0, 120.0)
+        fetch_timeout.setSingleStep(1.0)
+        fetch_timeout.setValue(float(getattr(self._session.cfg, "web_fetch_timeout_s", 20.0)))
+
+        fetch_max_chars = QtWidgets.QSpinBox()
+        fetch_max_chars.setRange(5_000, 1_000_000)
+        fetch_max_chars.setSingleStep(5_000)
+        fetch_max_chars.setValue(int(getattr(self._session.cfg, "web_fetch_max_chars", 120_000)))
+
+        fetch_cache_ttl = QtWidgets.QDoubleSpinBox()
+        fetch_cache_ttl.setRange(0.0, 24 * 3600.0)
+        fetch_cache_ttl.setSingleStep(60.0)
+        fetch_cache_ttl.setSuffix(" s")
+        fetch_cache_ttl.setValue(float(getattr(self._session.cfg, "web_fetch_cache_ttl_s", 30 * 60.0)))
 
         chk_read = QtWidgets.QCheckBox("Allow read_file")
         chk_read.setChecked(bool(self._session.cfg.allow_read_file))
@@ -1385,6 +1607,39 @@ class ChatWindow(QtWidgets.QMainWindow):
 
         chk_py = QtWidgets.QCheckBox("Allow python sandbox (numpy/pandas/matplotlib)")
         chk_py.setChecked(bool(getattr(self._session.cfg, "allow_python_sandbox", False)))
+
+        chk_pw = QtWidgets.QCheckBox("Enable Playwright browser (MCP)")
+        chk_pw.setChecked(bool(getattr(self._session.cfg, "enable_playwright_browser", False)))
+
+        chk_pw_allow = QtWidgets.QCheckBox("Allow Playwright browser tool (dangerous)")
+        chk_pw_allow.setChecked(bool(getattr(self._session.cfg, "allow_playwright_browser", False)))
+
+        chk_pw_headless = QtWidgets.QCheckBox("Playwright headless")
+        chk_pw_headless.setChecked(bool(getattr(self._session.cfg, "playwright_headless", True)))
+
+        chk_pw_watch = QtWidgets.QCheckBox("Playwright watch mode (auto screenshot after actions)")
+        chk_pw_watch.setChecked(bool(getattr(self._session.cfg, "playwright_watch_mode", False)))
+
+        chk_pw_full = QtWidgets.QCheckBox("Watch mode: full-page screenshots")
+        chk_pw_full.setChecked(bool(getattr(self._session.cfg, "playwright_screenshot_full_page", False)))
+
+        chk_pw_eval = QtWidgets.QCheckBox("Allow Playwright evaluate/run_code (very dangerous)")
+        chk_pw_eval.setChecked(bool(getattr(self._session.cfg, "allow_playwright_eval", False)))
+
+        chk_agents_sdk = QtWidgets.QCheckBox("Use Agents SDK (experimental)")
+        chk_agents_sdk.setChecked(bool(getattr(self._session.cfg, "use_agents_sdk", False)))
+
+        chk_ws = QtWidgets.QCheckBox("Enable Dev Workspace (code project per chat)")
+        chk_ws.setChecked(bool(getattr(self._session.cfg, "enable_dev_workspace", False)))
+
+        chk_ws_pip = QtWidgets.QCheckBox("Allow Dev Workspace pip installs (requires approval each time)")
+        chk_ws_pip.setChecked(bool(getattr(self._session.cfg, "allow_dev_pip_install", False)))
+
+        chk_ws_http = QtWidgets.QCheckBox("Allow Dev Workspace static HTTP server (localhost preview)")
+        chk_ws_http.setChecked(bool(getattr(self._session.cfg, "allow_dev_http_server", False)))
+
+        btn_pw_restart = QtWidgets.QPushButton("Restart Playwright session")
+        btn_pw_restart.setToolTip("Restarts the MCP browser server (use after toggling headless or when it gets stuck).")
 
         py_timeout = QtWidgets.QDoubleSpinBox()
         py_timeout.setRange(0.5, 120.0)
@@ -1418,6 +1673,11 @@ class ChatWindow(QtWidgets.QMainWindow):
 
         tl.addRow(chk_web)
         tl.addRow("Search context size", ctx)
+        tl.addRow(chk_fetch)
+        tl.addRow(fetch_readability)
+        tl.addRow("Web fetch timeout (s)", fetch_timeout)
+        tl.addRow("Web fetch max chars", fetch_max_chars)
+        tl.addRow("Web fetch cache TTL", fetch_cache_ttl)
         tl.addRow(chk_read)
         tl.addRow(chk_file)
         tl.addRow("Vector store IDs", vs_edit)
@@ -1425,6 +1685,17 @@ class ChatWindow(QtWidgets.QMainWindow):
         tl.addRow(chk_fs_results)
         tl.addRow(chk_write)
         tl.addRow(chk_py)
+        tl.addRow(chk_pw)
+        tl.addRow(chk_pw_allow)
+        tl.addRow(chk_pw_headless)
+        tl.addRow(chk_pw_watch)
+        tl.addRow(chk_pw_full)
+        tl.addRow(chk_pw_eval)
+        tl.addRow(chk_agents_sdk)
+        tl.addRow(chk_ws)
+        tl.addRow(chk_ws_pip)
+        tl.addRow(chk_ws_http)
+        tl.addRow(btn_pw_restart)
         tl.addRow("Python sandbox timeout (s)", py_timeout)
         tl.addRow(chk_setsys)
         tl.addRow(chk_propose)
@@ -1437,6 +1708,11 @@ class ChatWindow(QtWidgets.QMainWindow):
         def apply_tools() -> None:
             self._session.cfg.enable_web_search = bool(chk_web.isChecked())
             self._session.cfg.web_search_context_size = str(ctx.currentText())
+            self._session.cfg.enable_web_fetch = bool(chk_fetch.isChecked())
+            self._session.cfg.web_fetch_readability = bool(fetch_readability.isChecked())
+            self._session.cfg.web_fetch_timeout_s = float(fetch_timeout.value())
+            self._session.cfg.web_fetch_max_chars = int(fetch_max_chars.value())
+            self._session.cfg.web_fetch_cache_ttl_s = float(fetch_cache_ttl.value())
             self._session.cfg.allow_read_file = bool(chk_read.isChecked())
             self._session.cfg.enable_file_search = bool(chk_file.isChecked())
             raw = str(vs_edit.text() or "").strip()
@@ -1446,6 +1722,14 @@ class ChatWindow(QtWidgets.QMainWindow):
             self._session.cfg.include_file_search_results = bool(chk_fs_results.isChecked())
             self._session.cfg.allow_write_files = bool(chk_write.isChecked())
             self._session.cfg.allow_python_sandbox = bool(chk_py.isChecked())
+            self._session.cfg.enable_playwright_browser = bool(chk_pw.isChecked())
+            self._session.cfg.allow_playwright_browser = bool(chk_pw_allow.isChecked())
+            self._session.cfg.playwright_headless = bool(chk_pw_headless.isChecked())
+            self._session.cfg.playwright_watch_mode = bool(chk_pw_watch.isChecked())
+            self._session.cfg.playwright_screenshot_full_page = bool(chk_pw_full.isChecked())
+            self._session.cfg.allow_playwright_eval = bool(chk_pw_eval.isChecked())
+            prev_engine = bool(getattr(self._session.cfg, "use_agents_sdk", False))
+            self._session.cfg.use_agents_sdk = bool(chk_agents_sdk.isChecked())
             self._session.cfg.python_sandbox_timeout_s = float(py_timeout.value())
             self._session.cfg.allow_model_set_system_prompt = bool(chk_setsys.isChecked())
             self._session.cfg.allow_model_propose_tools = bool(chk_propose.isChecked())
@@ -1454,13 +1738,36 @@ class ChatWindow(QtWidgets.QMainWindow):
             self._session.cfg.max_submodels = int(max_sub.value())
             self._session.cfg.max_submodel_depth = int(max_depth.value())
             self._session.cfg.submodel_ping_s = float(ping_s.value())
-            self._append_message("Tool settings updated.", kind="tool")
+            self._session.cfg.enable_dev_workspace = bool(chk_ws.isChecked())
+            self._session.cfg.allow_dev_pip_install = bool(chk_ws_pip.isChecked())
+            self._session.cfg.allow_dev_http_server = bool(chk_ws_http.isChecked())
+            self._append_message(
+                "Tool settings updated. Note: changing Playwright headless mode requires restarting the Playwright session.",
+                kind="tool",
+            )
+            self._persist_ui_defaults()
             self._refresh_submodel_list()
+            # Switch engine if needed (after persisting settings).
+            if bool(chk_agents_sdk.isChecked()) != prev_engine:
+                self._append_message("Switching chat engine…", kind="tool")
+                self._switch_main_session_engine(use_agents_sdk=bool(chk_agents_sdk.isChecked()))
+                self._append_message("Chat engine switched.", kind="tool")
+                self._persist_ui_defaults()
+                self._refresh_submodel_list()
+
+        def restart_pw() -> None:
+            try:
+                self._session.restart_playwright()
+                self._append_message("Playwright session restarted.", kind="tool")
+            except Exception as e:
+                self._append_message(f"Failed to restart Playwright: {type(e).__name__}: {e}", kind="tool")
+
+        btn_pw_restart.clicked.connect(restart_pw)
 
         btn_apply_tools = QtWidgets.QPushButton("Apply tool settings")
         btn_apply_tools.setObjectName("btn_primary")
         btn_apply_tools.clicked.connect(apply_tools)
-        tl.addRow(btn_apply_tools)
+        tools_outer.addWidget(btn_apply_tools, 0)
 
         tabs.addTab(tools_tab, "Tools")
 
@@ -1481,6 +1788,7 @@ class ChatWindow(QtWidgets.QMainWindow):
             self._set_show_tool_events(chk_tool_events.isChecked())
             self._set_hide_think(chk_hide_think.isChecked())
             self._append_message("Display settings updated.", kind="tool")
+            self._persist_ui_defaults()
 
         btn_apply_disp = QtWidgets.QPushButton("Apply display settings")
         btn_apply_disp.setObjectName("btn_primary")
@@ -1488,6 +1796,42 @@ class ChatWindow(QtWidgets.QMainWindow):
         dl.addRow(btn_apply_disp)
 
         tabs.addTab(disp_tab, "Display")
+
+        # --- Telegram tab ---
+        tg_tab = QtWidgets.QWidget()
+        tgl = QtWidgets.QFormLayout(tg_tab)
+        tgl.setContentsMargins(12, 12, 12, 12)
+        tgl.setSpacing(10)
+
+        chk_tg = QtWidgets.QCheckBox("Enable Telegram bridge (via headless relay + chat_history/telegram)")
+        chk_tg.setChecked(bool(getattr(self._session.cfg, "enable_telegram_bridge", False)))
+        chk_tg_tools = QtWidgets.QCheckBox("Forward tool events to Telegram (verbose)")
+        chk_tg_tools.setChecked(bool(getattr(self._session.cfg, "telegram_send_tool_events", False)))
+        tgl.addRow(chk_tg)
+        tgl.addRow(chk_tg_tools)
+
+        hint = QtWidgets.QLabel(
+            "Note: run the relay in another terminal:\n"
+            "  .\\.venv\\Scripts\\python.exe -m desktop_agent.telegram_relay\n"
+            "Then, in the Telegram group, send /allow_here once to bind the group id."
+        )
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        tgl.addRow(hint)
+
+        def apply_tg() -> None:
+            self._session.cfg.enable_telegram_bridge = bool(chk_tg.isChecked())
+            self._session.cfg.telegram_send_tool_events = bool(chk_tg_tools.isChecked())
+            self._apply_telegram_bridge_state()
+            self._append_message("Telegram bridge settings updated.", kind="tool")
+            self._persist_ui_defaults()
+
+        btn_apply_tg = QtWidgets.QPushButton("Apply Telegram settings")
+        btn_apply_tg.setObjectName("btn_primary")
+        btn_apply_tg.clicked.connect(apply_tg)
+        tgl.addRow(btn_apply_tg)
+
+        tabs.addTab(tg_tab, "Telegram")
 
         dlg.exec()
 
@@ -1499,10 +1843,20 @@ class ChatWindow(QtWidgets.QMainWindow):
             self._interrupt_all_workers()
         _LOG.info("user_send chat_id=%s model=%s chars=%d", str(self._active_chat_id), str(self._session.cfg.model), len(text))
         self._input.clear()
+        self._handle_user_text(text=text, source="ui", from_name="User")
+
+    def _handle_user_text(self, *, text: str, source: str, from_name: str) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+
+        if source == "telegram":
+            # Avoid echoing the user's Telegram message back to Telegram (they already sent it there).
+            self._signals.append_tool.emit(f"[telegram] from={from_name}")
 
         self._last_user_text = text
         self._last_speaker_id = "user"
-        self._last_speaker_name = "User"
+        self._last_speaker_name = str(from_name or "User")
         self._last_speaker_text = text
         self._maybe_set_next_override_from_text(text)
         self._append_message(text, kind="user")
@@ -1654,7 +2008,7 @@ class ChatWindow(QtWidgets.QMainWindow):
     def _send_via_worker(
         self,
         *,
-        session: ChatSession,
+        session: Any,
         agent_name: str,
         agent_id: str | None = None,
         text: str,
@@ -1663,7 +2017,7 @@ class ChatWindow(QtWidgets.QMainWindow):
         stream_into: Bubble | None = None,
     ) -> None:
         worker = _Worker(
-            session=session,
+            runner=make_runner(session),
             text=text,
             show_tool_events=self._show_tool_events,
             hide_think=self._hide_think,
@@ -1691,8 +2045,10 @@ class ChatWindow(QtWidgets.QMainWindow):
             if did_skip:
                 assistant_bubble.set_text(f"**{agent_name}:**\n\n_(skipped)_")
                 self._signals.append_tool.emit(f"[skip] {agent_name} passed.")
+                self._telegram_send_text(f"{agent_name}: (skipped)", kind="assistant")
             else:
                 assistant_bubble.set_text(f"**{agent_name}:**\n\n" + cleaned)
+                self._telegram_send_text(f"{agent_name}: {cleaned}".strip(), kind="assistant")
             QtCore.QTimer.singleShot(0, self._scroll_to_bottom)
             QtCore.QTimer.singleShot(0, self._update_bubble_widths)
             # Refresh Agents tree after each completed turn (captures any submodel changes)
@@ -2207,11 +2563,16 @@ class ChatWindow(QtWidgets.QMainWindow):
         self._switching_chat = True
         try:
             data = load_chat(self._store_root, chat_id)
-            self._session.load_record(data)
-            self._active_chat_id = self._session.chat_id
+            use_sdk = bool(data.get("use_agents_sdk", False) or data.get("agents_sdk", False))
+            cfg = ChatConfig(**vars(self._session.cfg))
+            cfg.use_agents_sdk = use_sdk
+            sess = self._instantiate_session_any(cfg)
+            sess.load_record(data)  # type: ignore[attr-defined]
+            self._session = sess  # type: ignore[assignment]
+            self._active_chat_id = str(getattr(self._session, "chat_id", chat_id))
 
             # Recreate the agent hub for this chat so per-chat agent crews can differ.
-            self._hub = AgentHub(base_config=self._session.cfg, make_session=self._instantiate_session, repo_root=self._store_root)
+            self._hub = AgentHub(base_config=self._session.cfg, make_session=self._instantiate_session_any, repo_root=self._store_root)
             self._hub.set_main(agent_id=str(self._session.chat_id), name="Main", session=self._session)
             agents_state = data.get("agents_state")
             if isinstance(agents_state, dict):
@@ -2247,6 +2608,7 @@ class ChatWindow(QtWidgets.QMainWindow):
                         if isinstance(t, str) and t.strip():
                             self._append_message(t.strip(), kind="user" if role == "user" else "assistant")
             self._refresh_submodel_list()
+            self._apply_telegram_bridge_state()
         finally:
             self._switching_chat = False
 
@@ -2556,12 +2918,108 @@ class ChatWindow(QtWidgets.QMainWindow):
         sess.close_submodel(sid)
         self._refresh_submodel_list()
 
+    # ---- Telegram bridge (file IPC) ----
+
+    def _on_tool_text(self, t: str) -> None:
+        self._append_message(t, kind="tool")
+        if bool(getattr(self._session.cfg, "enable_telegram_bridge", False)) and bool(
+            getattr(self._session.cfg, "telegram_send_tool_events", False)
+        ):
+            self._telegram_send_text(str(t or ""), kind="tool")
+
+    def _telegram_state_path(self) -> Path:
+        return (self._store_root / "chat_history" / "telegram" / "relay_state.json").resolve()
+
+    def _telegram_allowed_chat_id(self) -> int | None:
+        try:
+            p = self._telegram_state_path()
+            if not p.exists():
+                return None
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(d, dict):
+                return None
+            v = d.get("allowed_chat_id")
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    def _telegram_send_text(self, text: str, *, kind: str) -> None:
+        if not bool(getattr(self._session.cfg, "enable_telegram_bridge", False)):
+            return
+        chat_id = self._telegram_allowed_chat_id()
+        if chat_id is None:
+            return
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        # Keep messages reasonably sized for Telegram.
+        if len(msg) > 3500:
+            msg = msg[:3500] + " …"
+        try:
+            ensure_telegram_dirs(self._store_root)
+            write_outbox_message(repo_root=self._store_root, chat_id=int(chat_id), text=msg)
+        except Exception:
+            pass
+
+    def _apply_telegram_bridge_state(self) -> None:
+        enabled = bool(getattr(self._session.cfg, "enable_telegram_bridge", False))
+        if enabled:
+            ensure_telegram_dirs(self._store_root)
+            if self._telegram_timer is None:
+                t = QtCore.QTimer(self)
+                t.setInterval(600)
+                t.timeout.connect(self._telegram_tick)
+                t.start()
+                self._telegram_timer = t
+        else:
+            if self._telegram_timer is not None:
+                try:
+                    self._telegram_timer.stop()
+                except Exception:
+                    pass
+                self._telegram_timer = None
+
+    def _telegram_tick(self) -> None:
+        if self._switching_chat:
+            return
+        try:
+            inbox, _ = ensure_telegram_dirs(self._store_root)
+        except Exception:
+            return
+        for p in safe_list_json_files(inbox):
+            try:
+                m = read_inbox_message(p)
+                txt = str(m.text or "").strip()
+                if txt:
+                    self._telegram_pending.append((m.from_name or "Telegram", txt))
+            except Exception:
+                pass
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        # Process at most one inbound message per tick, and only if we are idle.
+        if not self._telegram_pending:
+            return
+        if self._workers:
+            return
+        from_name, txt = self._telegram_pending.pop(0)
+        self._handle_user_text(text=txt, source="telegram", from_name=from_name)
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         # Best-effort shutdown of background threads to avoid "QThread destroyed" warnings.
         _LOG.info("ui_close chat_id=%s model=%s", str(self._active_chat_id), str(self._session.cfg.model))
         try:
             if self._mention_timer is not None:
                 self._mention_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._telegram_timer is not None:
+                self._telegram_timer.stop()
         except Exception:
             pass
         self._hide_mention_popup()
@@ -2601,14 +3059,14 @@ class _Worker(QtCore.QThread):
     def __init__(
         self,
         *,
-        session: ChatSession,
+        runner: Any,
         text: str,
         show_tool_events: bool,
         hide_think: bool,
         parent: Optional[QtCore.QObject],
     ) -> None:
         super().__init__(parent)
-        self.session = session
+        self.runner = runner
         self.text = text
         self.show_tool_events = show_tool_events
         self.hide_think = hide_think
@@ -2623,10 +3081,10 @@ class _Worker(QtCore.QThread):
             last_emit = 0.0
             last_tok_emit = 0.0
             new_items: list[dict[str, Any]] = []
-            prompt_tok_est = self.session.estimate_prompt_tokens(user_text=self.text)
-            max_ctx = int(getattr(self.session.cfg, "context_window_tokens", 0) or 0)
+            prompt_tok_est = self.runner.estimate_prompt_tokens(user_text=self.text)
+            max_ctx = int(getattr(getattr(self.runner, "cfg", None), "context_window_tokens", 0) or 0)
 
-            for ev in self.session.send_stream(self.text):
+            for ev in self.runner.send_stream(self.text):
                 if self.isInterruptionRequested():
                     return
                 et = ev.get("type")
@@ -2640,7 +3098,7 @@ class _Worker(QtCore.QThread):
                         self.signals.assistant_partial.emit(shown)
                         last_emit = now
                     if now - last_tok_emit >= 0.20:
-                        out_tok_est = self.session.estimate_tokens(full_raw)
+                        out_tok_est = self.runner.estimate_tokens(full_raw)
                         used_est = int(prompt_tok_est + out_tok_est)
                         if max_ctx > 0:
                             pct = (used_est / max_ctx) * 100.0
@@ -2655,6 +3113,28 @@ class _Worker(QtCore.QThread):
 
             if self.isInterruptionRequested():
                 return
+
+            # Collect any image outputs produced by tools (e.g. playwright_browser, python_sandbox).
+            # If tool events are hidden, we still surface the images inline in the assistant bubble.
+            tool_image_paths: list[str] = []
+            for item in new_items:
+                if item.get("type") != "function_call_output":
+                    continue
+                out_full = item.get("output", "")
+                if not (isinstance(out_full, str) and out_full.strip().startswith("{")):
+                    continue
+                try:
+                    d = json.loads(out_full)
+                except Exception:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                imgs = d.get("image_paths")
+                if not isinstance(imgs, list):
+                    continue
+                for p in imgs:
+                    if isinstance(p, str) and p.strip() and p.strip() not in tool_image_paths:
+                        tool_image_paths.append(p.strip())
 
             if self.show_tool_events:
                 for item in new_items:
@@ -2743,8 +3223,15 @@ class _Worker(QtCore.QThread):
                                     self.signals.tool.emit(f"  {i}. {fname} score={score}")
 
             out = (_strip_think(full_raw) if self.hide_think else full_raw).strip()
+            if (not self.show_tool_events) and tool_image_paths:
+                # Emit at most a few images to keep the chat compact.
+                for p in tool_image_paths[:6]:
+                    out += f"\n\n[[image:{p}]]"
             self.signals.assistant_final.emit(out)
-            self.signals.tokens.emit(self.session.usage_ratio_text())
+            try:
+                self.signals.tokens.emit(str(self.runner.usage_ratio_text()))
+            except Exception:
+                pass
         except Exception as e:
             try:
                 preview = (self.text or "").replace("\r", "").strip()
@@ -2752,8 +3239,8 @@ class _Worker(QtCore.QThread):
                     preview = preview[:800] + " …"
                 _LOG.error(
                     "worker_exception chat_id=%s model=%s error=%s\nprompt_preview:\n%s\ntraceback:\n%s",
-                    str(getattr(self.session, "chat_id", "")),
-                    str(getattr(getattr(self.session, "cfg", None), "model", "")),
+                    str(getattr(getattr(self.runner, "session", self.runner), "chat_id", "")),
+                    str(getattr(getattr(self.runner, "cfg", None), "model", "")),
                     f"{type(e).__name__}: {e}",
                     preview,
                     traceback.format_exc(),
