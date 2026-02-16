@@ -91,6 +91,46 @@ def strip_terminal_blocks(text: str) -> str:
     return t
 
 
+def _peer_agent_ask_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "peer_agent_ask",
+        "description": "Ask another Terminal Agent (another terminal tab) for help. Returns their response text.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "peer_name": {"type": "string", "description": "Target agent/tab name (e.g. 'Main')."},
+                "message": {"type": "string", "description": "What you want the peer to do or answer."},
+                "max_rounds": {
+                    "type": "integer",
+                    "description": "Max internal terminal rounds the peer may run while answering (default 3).",
+                    "default": 3,
+                },
+            },
+            "required": ["peer_name", "message"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _peer_terminal_run_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "peer_terminal_run",
+        "description": "Run a command in another terminal tab and return its output (no LLM involved).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "peer_name": {"type": "string", "description": "Target agent/tab name (e.g. 'Main')."},
+                "command": {"type": "string", "description": "Command to run in the peer terminal."},
+                "max_wait_s": {"type": "number", "description": "Max seconds to wait (default 25).", "default": 25.0},
+            },
+            "required": ["peer_name", "command"],
+            "additionalProperties": False,
+        },
+    }
+
+
 @dataclass
 class CommandResult:
     command: str
@@ -789,36 +829,40 @@ class _Worker(QtCore.QThread):
             self.signals.busy.emit(False)
 
 
+@dataclass
+class _TabState:
+    tab_id: str
+    name: str
+    session: ChatSession
+    session_lock: threading.Lock
+    terminal: Any
+    using_conpty: bool
+    term_signals: _TermSignals
+    worker: _Worker | None
+    tokens_text: str
+    # UI widgets (per tab)
+    chat_scroll: QtWidgets.QScrollArea
+    chat_layout: QtWidgets.QVBoxLayout
+    terminal_view: QtWidgets.QPlainTextEdit
+    terminal_input: QtWidgets.QLineEdit
+    terminal_run_btn: QtWidgets.QPushButton
+
+
 class TerminalAgentWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         self._app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         super().__init__()
 
-        self._session = self._make_session()
-        self._terminal: Any = None
-        self._term_signals = _TermSignals()
-        self._worker: _Worker | None = None
         self._hide_think = False
+        self._tabs: dict[str, _TabState] = {}
+        self._active_tab_id: str | None = None
 
         self._build_ui()
         self._apply_style()
 
-        # Now that widgets exist, wire terminal output + start terminal backend.
-        self._term_signals.chunk.connect(self._terminal_append)
-        try:
-            self._terminal = _ConptyTerminal(initial_cwd=_repo_root(), on_chunk=lambda s: self._term_signals.chunk.emit(s))
-            self._using_conpty = True
-        except Exception as e:
-            self._terminal = _TerminalRunner(initial_cwd=_repo_root(), on_chunk=lambda s: self._term_signals.chunk.emit(s))
-            self._using_conpty = False
-            QtCore.QTimer.singleShot(0, lambda: self._append_chat(f"[terminal] ConPTY unavailable; using fallback runner: {e}", kind="tool"))
-
         self.resize(1680, 900)
         self.setWindowTitle("Terminal Agent")
-        try:
-            self._cwd_label.setText(str(getattr(self._terminal, "cwd", _repo_root())))
-        except Exception:
-            self._cwd_label.setText(str(_repo_root()))
+        self._new_tab(name="Main")
 
         self._append_chat(
             "Tip: Ask for something like “@Main, set up a venv and run tests” and it can execute commands via <Terminal> blocks.",
@@ -839,7 +883,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         font.setPointSize(10)
         self._app.setFont(font)
 
-    def _make_session(self) -> ChatSession:
+    def _make_session(self, *, agent_name: str) -> ChatSession:
         app_cfg = load_config()
         api_key = app_cfg.openai_api_key or os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -865,7 +909,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         s = ChatSession(api_key=api_key, config=ccfg)
         s.set_system_prompt(
             (
-                "You are Terminal Agent, an assistant that can run PowerShell commands.\n"
+                f"You are Terminal Agent ({agent_name}), an assistant that can run PowerShell commands.\n"
                 "When you want to execute commands, emit a <Terminal>...</Terminal> block.\n"
                 "Anything inside <Terminal>...</Terminal> will be executed in the attached interactive PowerShell terminal (ConPTY).\n"
                 "This behaves like a real terminal: SSH is interactive and stays open, and you can run subsequent commands naturally.\n"
@@ -873,6 +917,10 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
                 "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
                 "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
+                "\n"
+                "Collaboration:\n"
+                "- You can ask other terminal-tab agents for help with `peer_agent_ask(peer_name, message)`.\n"
+                "- You can run a command in another tab with `peer_terminal_run(peer_name, command)`.\n"
             )
         )
         return s
@@ -909,17 +957,8 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         header.addWidget(self._btn_stop)
         cl.addLayout(header)
 
-        self._chat_scroll = QtWidgets.QScrollArea()
-        self._chat_scroll.setWidgetResizable(True)
-        self._chat_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        cl.addWidget(self._chat_scroll, 1)
-
-        chat = QtWidgets.QWidget()
-        self._chat_layout = QtWidgets.QVBoxLayout(chat)
-        self._chat_layout.setContentsMargins(0, 0, 0, 0)
-        self._chat_layout.setSpacing(10)
-        self._chat_layout.addStretch(1)
-        self._chat_scroll.setWidget(chat)
+        self._chat_stack = QtWidgets.QStackedWidget()
+        cl.addWidget(self._chat_stack, 1)
 
         bottom = QtWidgets.QHBoxLayout()
         self._chat_input = QtWidgets.QTextEdit()
@@ -949,27 +988,18 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         ttitle = QtWidgets.QLabel("Terminal")
         ttitle.setObjectName("title")
         thead.addWidget(ttitle)
+        self._btn_new_tab = QtWidgets.QPushButton("New")
+        self._btn_new_tab.setObjectName("btn_ghost")
+        thead.addWidget(self._btn_new_tab)
         thead.addStretch(1)
         self._cwd_label = QtWidgets.QLabel("")
         self._cwd_label.setObjectName("cwd_label")
         thead.addWidget(self._cwd_label)
         tl.addLayout(thead)
 
-        self._terminal_view = QtWidgets.QPlainTextEdit()
-        self._terminal_view.setObjectName("terminal_view")
-        self._terminal_view.setReadOnly(True)
-        self._terminal_view.setWordWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
-        tl.addWidget(self._terminal_view, 1)
-
-        tbot = QtWidgets.QHBoxLayout()
-        self._terminal_input = QtWidgets.QLineEdit()
-        self._terminal_input.setObjectName("terminal_input")
-        self._terminal_input.setPlaceholderText("Type a command to run manually…")
-        self._btn_run = QtWidgets.QPushButton("Run")
-        self._btn_run.setObjectName("btn_ghost")
-        tbot.addWidget(self._terminal_input, 1)
-        tbot.addWidget(self._btn_run)
-        tl.addLayout(tbot)
+        self._term_tabs = QtWidgets.QTabWidget()
+        self._term_tabs.setTabsClosable(True)
+        tl.addWidget(self._term_tabs, 1)
 
         splitter.addWidget(term_panel)
         splitter.setSizes([860, 820])
@@ -977,8 +1007,9 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         # wiring
         self._btn_send.clicked.connect(self._on_send)
         self._btn_stop.clicked.connect(self._on_stop)
-        self._btn_run.clicked.connect(self._on_run_manual)
-        self._terminal_input.returnPressed.connect(self._on_run_manual)
+        self._btn_new_tab.clicked.connect(lambda: self._new_tab())
+        self._term_tabs.currentChanged.connect(self._on_tab_changed)
+        self._term_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
         self._chat_input.installEventFilter(self)
 
     def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:  # noqa: N802
@@ -991,9 +1022,254 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 return True
         return super().eventFilter(obj, event)
 
+    def _active_tab(self) -> _TabState:
+        if self._active_tab_id and self._active_tab_id in self._tabs:
+            return self._tabs[self._active_tab_id]
+        # Fallback to current tab widget property.
+        w = self._term_tabs.currentWidget() if hasattr(self, "_term_tabs") else None
+        if w is not None:
+            tid = w.property("tab_id")
+            if isinstance(tid, str) and tid in self._tabs:
+                self._active_tab_id = tid
+                return self._tabs[tid]
+        raise RuntimeError("No active terminal tab")
+
+    def _on_tab_changed(self, index: int) -> None:
+        w = self._term_tabs.widget(index)
+        tid = w.property("tab_id") if w is not None else None
+        if not isinstance(tid, str) or tid not in self._tabs:
+            return
+        self._active_tab_id = tid
+        st = self._tabs[tid]
+        try:
+            self._chat_stack.setCurrentWidget(st.chat_scroll)
+        except Exception:
+            pass
+        try:
+            self._tokens.setText(st.tokens_text or "")
+        except Exception:
+            pass
+        try:
+            self._cwd_label.setText(str(getattr(st.terminal, "cwd", _repo_root())))
+        except Exception:
+            self._cwd_label.setText(str(_repo_root()))
+
+    def _on_tab_close_requested(self, index: int) -> None:
+        if self._term_tabs.count() <= 1:
+            return
+        w = self._term_tabs.widget(index)
+        tid = w.property("tab_id") if w is not None else None
+        if not isinstance(tid, str) or tid not in self._tabs:
+            return
+        st = self._tabs.pop(tid)
+        try:
+            if st.worker is not None and st.worker.isRunning():
+                st.worker.request_stop()
+        except Exception:
+            pass
+        try:
+            st.terminal.stop_and_reset()
+        except Exception:
+            pass
+        try:
+            self._term_tabs.removeTab(index)
+        except Exception:
+            pass
+        try:
+            self._chat_stack.removeWidget(st.chat_scroll)
+            st.chat_scroll.deleteLater()
+        except Exception:
+            pass
+
+    def _new_tab(self, *, name: str | None = None) -> None:
+        tab_id = secrets.token_hex(4)
+        tab_name = (name or f"Term {self._term_tabs.count() + 1}").strip() or f"Term {self._term_tabs.count() + 1}"
+        # Ensure name uniqueness (tools refer to peers by name).
+        existing = {t.name for t in self._tabs.values()}
+        if tab_name in existing:
+            base = tab_name
+            k = 2
+            while f"{base} ({k})" in existing:
+                k += 1
+            tab_name = f"{base} ({k})"
+
+        session = self._make_session(agent_name=tab_name)
+        session_lock = threading.Lock()
+
+        term_signals = _TermSignals()
+        using_conpty = True
+        try:
+            terminal = _ConptyTerminal(initial_cwd=_repo_root(), on_chunk=lambda s: term_signals.chunk.emit(s))
+            using_conpty = True
+        except Exception as e:
+            terminal = _TerminalRunner(initial_cwd=_repo_root(), on_chunk=lambda s: term_signals.chunk.emit(s))
+            using_conpty = False
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: self._append_chat(
+                    f"[terminal] ConPTY unavailable for '{tab_name}'; using fallback runner: {e}", kind="tool"
+                ),
+            )
+
+        # Terminal tab widget.
+        tab = QtWidgets.QWidget()
+        tab.setProperty("tab_id", tab_id)
+        v = QtWidgets.QVBoxLayout(tab)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+
+        terminal_view = QtWidgets.QPlainTextEdit()
+        terminal_view.setObjectName("terminal_view")
+        terminal_view.setReadOnly(True)
+        terminal_view.setWordWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
+        v.addWidget(terminal_view, 1)
+
+        tbot = QtWidgets.QHBoxLayout()
+        terminal_input = QtWidgets.QLineEdit()
+        terminal_input.setObjectName("terminal_input")
+        terminal_input.setPlaceholderText("Type a command to run manually…")
+        terminal_run_btn = QtWidgets.QPushButton("Run")
+        terminal_run_btn.setObjectName("btn_ghost")
+        tbot.addWidget(terminal_input, 1)
+        tbot.addWidget(terminal_run_btn)
+        v.addLayout(tbot)
+
+        # Chat pane for this tab.
+        chat_scroll = QtWidgets.QScrollArea()
+        chat_scroll.setWidgetResizable(True)
+        chat_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        chat = QtWidgets.QWidget()
+        chat_layout = QtWidgets.QVBoxLayout(chat)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(10)
+        chat_layout.addStretch(1)
+        chat_scroll.setWidget(chat)
+        self._chat_stack.addWidget(chat_scroll)
+
+        st = _TabState(
+            tab_id=tab_id,
+            name=tab_name,
+            session=session,
+            session_lock=session_lock,
+            terminal=terminal,
+            using_conpty=using_conpty,
+            term_signals=term_signals,
+            worker=None,
+            tokens_text="",
+            chat_scroll=chat_scroll,
+            chat_layout=chat_layout,
+            terminal_view=terminal_view,
+            terminal_input=terminal_input,
+            terminal_run_btn=terminal_run_btn,
+        )
+        self._tabs[tab_id] = st
+
+        # ---- peer collaboration tools (per agent) ----
+
+        def _find_peer_by_name(peer_name: str) -> _TabState | None:
+            peer_name = (peer_name or "").strip()
+            if not peer_name:
+                return None
+            for tt in self._tabs.values():
+                if tt.name == peer_name:
+                    return tt
+            return None
+
+        def peer_terminal_run(args: JsonDict, *, caller_id: str = tab_id) -> str:
+            peer_name = args.get("peer_name")
+            command = args.get("command")
+            max_wait_s = float(args.get("max_wait_s", 25.0))
+            if not isinstance(peer_name, str) or not peer_name.strip():
+                return json.dumps({"ok": False, "error": "peer_name must be a non-empty string"})
+            if not isinstance(command, str) or not command.strip():
+                return json.dumps({"ok": False, "error": "command must be a non-empty string"})
+            peer = _find_peer_by_name(peer_name)
+            if peer is None:
+                return json.dumps({"ok": False, "error": f"peer not found: {peer_name}"})
+            if peer.tab_id == caller_id:
+                return json.dumps({"ok": False, "error": "cannot target self"})
+            with peer.session_lock:
+                res = peer.terminal.send_and_collect(block=command.strip(), idle_ms=450, max_wait_s=max_wait_s)
+            return json.dumps(
+                {
+                    "ok": True,
+                    "peer": peer.name,
+                    "command": command.strip(),
+                    "stdout": res.stdout,
+                    "elapsed_s": res.elapsed_s,
+                    "cwd": getattr(peer.terminal, "cwd", None),
+                },
+                ensure_ascii=False,
+            )
+
+        def peer_agent_ask(args: JsonDict, *, caller_id: str = tab_id) -> str:
+            peer_name = args.get("peer_name")
+            message = args.get("message")
+            max_rounds = int(args.get("max_rounds", 3))
+            if not isinstance(peer_name, str) or not peer_name.strip():
+                return json.dumps({"ok": False, "error": "peer_name must be a non-empty string"})
+            if not isinstance(message, str) or not message.strip():
+                return json.dumps({"ok": False, "error": "message must be a non-empty string"})
+            peer = _find_peer_by_name(peer_name)
+            if peer is None:
+                return json.dumps({"ok": False, "error": f"peer not found: {peer_name}"})
+            if peer.tab_id == caller_id:
+                return json.dumps({"ok": False, "error": "cannot target self"})
+            max_rounds = max(1, min(8, max_rounds))
+
+            with peer.session_lock:
+                from_name = self._tabs[caller_id].name if caller_id in self._tabs else "peer"
+                pending = (
+                    f"[peer_request]\nFrom: {from_name}\nTask: {message.strip()}\n\n"
+                    "If you need to run commands, emit <Terminal>...</Terminal> blocks.\n"
+                )
+                last_assistant = ""
+                for _ in range(max_rounds):
+                    delta = peer.session.send(pending)
+                    last_assistant = str(delta.assistant_text or "")
+                    blocks = extract_terminal_blocks(last_assistant)
+                    if not blocks:
+                        break
+                    parts: list[str] = []
+                    for b in blocks:
+                        peer.terminal.send_and_collect(block=b, idle_ms=450, max_wait_s=25.0)
+                        parts.append(f"$ {b}\n(ok)\n")
+                    pending = (
+                        "Terminal results:\n"
+                        + "\n---\n".join(parts)
+                        + "\n\nContinue. If more commands are needed, emit more <Terminal> blocks; otherwise reply with a summary."
+                    )
+
+            return json.dumps(
+                {"ok": True, "peer": peer.name, "text": strip_terminal_blocks(last_assistant)},
+                ensure_ascii=False,
+            )
+
+        try:
+            session.registry.add(tool_spec=_peer_terminal_run_tool_spec(), handler=peer_terminal_run)
+            session.registry.add(tool_spec=_peer_agent_ask_tool_spec(), handler=peer_agent_ask)
+        except Exception:
+            pass
+
+        # Wire terminal chunks to this tab.
+        term_signals.chunk.connect(lambda s, tid=tab_id: self._terminal_append(tid, s))
+
+        terminal_run_btn.clicked.connect(lambda: self._on_run_manual(tab_id))
+        terminal_input.returnPressed.connect(lambda: self._on_run_manual(tab_id))
+
+        self._term_tabs.addTab(tab, tab_name)
+        self._term_tabs.setCurrentWidget(tab)
+        self._active_tab_id = tab_id
+        self._chat_stack.setCurrentWidget(chat_scroll)
+        try:
+            self._cwd_label.setText(str(getattr(terminal, "cwd", _repo_root())))
+        except Exception:
+            self._cwd_label.setText(str(_repo_root()))
+
     # ---- chat helpers ----
 
-    def _append_chat(self, text: str, *, kind: str) -> Bubble:
+    def _append_chat(self, text: str, *, kind: str, tab_id: str | None = None) -> Bubble:
+        st = self._tabs[tab_id] if (isinstance(tab_id, str) and tab_id in self._tabs) else self._active_tab()
         bubble = Bubble(text=text, kind=kind)
         container = QtWidgets.QWidget()
         container.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Minimum)
@@ -1006,15 +1282,19 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         else:
             row.addWidget(bubble, 0)
             row.addStretch(1)
-        self._chat_layout.insertWidget(self._chat_layout.count() - 1, container)
-        QtCore.QTimer.singleShot(0, self._scroll_chat_bottom)
+        st.chat_layout.insertWidget(st.chat_layout.count() - 1, container)
+        QtCore.QTimer.singleShot(0, lambda: self._scroll_chat_bottom(st.tab_id))
         return bubble
 
-    def _scroll_chat_bottom(self) -> None:
-        bar = self._chat_scroll.verticalScrollBar()
+    def _scroll_chat_bottom(self, tab_id: str | None = None) -> None:
+        st = self._tabs[tab_id] if (isinstance(tab_id, str) and tab_id in self._tabs) else self._active_tab()
+        bar = st.chat_scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
 
-    def _set_busy(self, busy: bool) -> None:
+    def _set_busy(self, tab_id: str, busy: bool) -> None:
+        if tab_id not in self._tabs:
+            return
+        st = self._tabs[tab_id]
         # Keep chat input enabled even while busy so the user can interrupt.
         # Sending while busy will stop the current worker and start a new turn.
         self._chat_input.setEnabled(True)
@@ -1023,40 +1303,48 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
         # Manual terminal interaction is still allowed while busy, but we disable the
         # Run button to avoid racing the model's auto-runs.
-        self._btn_run.setEnabled(not busy)
-        self._terminal_input.setEnabled(not busy)
+        st.terminal_run_btn.setEnabled(not busy)
+        st.terminal_input.setEnabled(not busy)
 
     # ---- terminal helpers ----
 
-    def _terminal_append(self, s: str) -> None:
-        self._terminal_view.moveCursor(QtGui.QTextCursor.MoveOperation.End)
-        self._terminal_view.insertPlainText(s)
-        self._terminal_view.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+    def _terminal_append(self, tab_id: str, s: str) -> None:
+        if tab_id not in self._tabs:
+            return
+        tv = self._tabs[tab_id].terminal_view
+        tv.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+        tv.insertPlainText(s)
+        tv.moveCursor(QtGui.QTextCursor.MoveOperation.End)
 
     # ---- actions ----
 
-    def _on_run_manual(self) -> None:
-        cmd = self._terminal_input.text().strip()
+    def _on_run_manual(self, tab_id: str) -> None:
+        if tab_id not in self._tabs:
+            return
+        st = self._tabs[tab_id]
+        cmd = st.terminal_input.text().strip()
         if not cmd:
             return
-        self._terminal_input.clear()
-        self._terminal_append(f"\nPS {self._terminal.cwd}> {cmd}\n")
+        st.terminal_input.clear()
+        self._terminal_append(tab_id, f"\nPS {getattr(st.terminal, 'cwd', '')}> {cmd}\n")
         try:
-            res = self._terminal.send_and_collect(block=cmd, idle_ms=450, max_wait_s=25.0)
+            res = st.terminal.send_and_collect(block=cmd, idle_ms=450, max_wait_s=25.0)
             if res.cwd_after:
-                self._cwd_label.setText(str(self._terminal.cwd))
+                if self._active_tab_id == tab_id:
+                    self._cwd_label.setText(str(getattr(st.terminal, "cwd", _repo_root())))
         except Exception as e:
-            self._terminal_append(f"\n[error] {type(e).__name__}: {e}\n")
+            self._terminal_append(tab_id, f"\n[error] {type(e).__name__}: {e}\n")
 
     def _on_stop(self) -> None:
-        w = self._worker
+        st = self._active_tab()
+        w = st.worker
         if w is not None and w.isRunning():
             w.request_stop()
             self._append_chat("[stopped]", kind="tool")
         # Hard stop: kill any running command and close interactive SSH sessions.
         try:
-            self._terminal.stop_and_reset()
-            self._terminal_append("\n[terminal reset]\n")
+            st.terminal.stop_and_reset()
+            self._terminal_append(st.tab_id, "\n[terminal reset]\n")
         except Exception:
             pass
 
@@ -1065,44 +1353,45 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         if not text:
             return
         self._chat_input.clear()
-        self._append_chat(text, kind="user")
+        st = self._active_tab()
+        self._append_chat(text, kind="user", tab_id=st.tab_id)
 
         # One worker at a time.
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.request_stop()
+        if st.worker is not None and st.worker.isRunning():
+            st.worker.request_stop()
 
         assistant_bubble: Bubble | None = None
 
         w = _Worker(
-            session=self._session,
+            session=st.session,
             user_text=text,
-            terminal=self._terminal,
+            terminal=st.terminal,
             max_rounds=6,
             hide_think=self._hide_think,
             parent=self,
         )
-        self._worker = w
+        st.worker = w
 
-        w.signals.busy.connect(self._set_busy)
-        w.signals.tokens.connect(self._tokens.setText)
-        w.signals.tool_msg.connect(lambda t: self._append_chat(t, kind="tool"))
-        w.signals.terminal_append.connect(self._terminal_append)
-        w.signals.cwd_changed.connect(self._cwd_label.setText)
-        w.signals.error.connect(lambda e: self._append_chat(f"[error] {e}", kind="tool"))
+        w.signals.busy.connect(lambda b, tid=st.tab_id: self._set_busy(tid, b))
+        w.signals.tokens.connect(lambda t, tid=st.tab_id: self._on_tokens(tid, t))
+        w.signals.tool_msg.connect(lambda t, tid=st.tab_id: self._append_chat(t, kind="tool", tab_id=tid))
+        w.signals.terminal_append.connect(lambda s, tid=st.tab_id: self._terminal_append(tid, s))
+        w.signals.cwd_changed.connect(lambda c, tid=st.tab_id: self._on_cwd_changed(tid, c))
+        w.signals.error.connect(lambda e, tid=st.tab_id: self._append_chat(f"[error] {e}", kind="tool", tab_id=tid))
 
         def on_partial(t: str) -> None:
             nonlocal assistant_bubble
             if assistant_bubble is None:
-                assistant_bubble = self._append_chat("", kind="assistant")
+                assistant_bubble = self._append_chat("", kind="assistant", tab_id=st.tab_id)
             assistant_bubble.set_streaming_text(t)
-            QtCore.QTimer.singleShot(0, self._scroll_chat_bottom)
+            QtCore.QTimer.singleShot(0, lambda: self._scroll_chat_bottom(st.tab_id))
 
         def on_final(t: str) -> None:
             nonlocal assistant_bubble
             if assistant_bubble is None:
-                assistant_bubble = self._append_chat("", kind="assistant")
+                assistant_bubble = self._append_chat("", kind="assistant", tab_id=st.tab_id)
             assistant_bubble.set_text(t)
-            QtCore.QTimer.singleShot(0, self._scroll_chat_bottom)
+            QtCore.QTimer.singleShot(0, lambda: self._scroll_chat_bottom(st.tab_id))
             # Terminal Agent may run multiple LLM rounds per user turn (when <Terminal> blocks
             # are executed and results are fed back). Each round should append a new assistant
             # message rather than overwriting the previous one.
@@ -1110,8 +1399,26 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
         w.signals.chat_partial.connect(on_partial)
         w.signals.chat_final.connect(on_final)
-        w.finished.connect(lambda: setattr(self, "_worker", None))
+        w.finished.connect(lambda tid=st.tab_id: self._on_worker_finished(tid))
         w.start()
+
+    def _on_worker_finished(self, tab_id: str) -> None:
+        if tab_id in self._tabs:
+            self._tabs[tab_id].worker = None
+
+    def _on_tokens(self, tab_id: str, text: str) -> None:
+        if tab_id not in self._tabs:
+            return
+        st = self._tabs[tab_id]
+        st.tokens_text = str(text or "")
+        if self._active_tab_id == tab_id:
+            self._tokens.setText(st.tokens_text)
+
+    def _on_cwd_changed(self, tab_id: str, cwd: str) -> None:
+        if tab_id not in self._tabs:
+            return
+        if self._active_tab_id == tab_id:
+            self._cwd_label.setText(str(cwd or ""))
 
 
 def main() -> None:
