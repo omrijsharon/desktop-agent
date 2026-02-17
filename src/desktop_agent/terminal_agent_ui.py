@@ -96,7 +96,7 @@ def strip_terminal_blocks(text: str) -> str:
     return t
 
 
-def _truncate_terminal_lines(text: str, *, max_lines: int = 20) -> str:
+def _truncate_terminal_lines(text: str, *, max_lines: int = 200) -> str:
     lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if max_lines >= 1 and len(lines) > max_lines:
         lines = lines[-max_lines:]
@@ -134,7 +134,7 @@ def _sanitize_terminal_blocks_in_conversation(
         # window in-context while still preventing the history from growing unbounded.
         existing_blocks = extract_terminal_blocks(last_txt_with_block or "")
         latest = (existing_blocks[-1] if existing_blocks else "").strip()
-    latest = _truncate_terminal_lines(latest, max_lines=20) if latest else ""
+    latest = _truncate_terminal_lines(latest, max_lines=200) if latest else ""
 
     i_keep, j_keep = last_pos
     for i, item in enumerate(conversation_items):
@@ -188,6 +188,317 @@ def _wait_tool_handler(args: JsonDict) -> str:
     s = max(0.0, min(5.0, s))
     time.sleep(s)
     return json.dumps({"ok": True, "slept_s": s}, ensure_ascii=False)
+
+
+def _ssh_read_file_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "ssh_read_file",
+        "description": "Read a text file from a remote host over SSH (non-interactive). Useful when interactive editors (nano/vim) are hard to drive.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Remote host (e.g. omrijsharon.local)."},
+                "user": {"type": "string", "description": "SSH username (e.g. omrijsharon)."},
+                "path": {"type": "string", "description": "Remote file path to read (POSIX path)."},
+                "sudo": {
+                    "type": "boolean",
+                    "description": "Use sudo (non-interactive: sudo -n). Fails if a password is required.",
+                    "default": False,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Max characters to return (truncates).",
+                    "default": 40000,
+                    "minimum": 1,
+                    "maximum": 200000,
+                },
+                "timeout_s": {"type": "number", "description": "SSH command timeout seconds.", "default": 20.0, "minimum": 1.0, "maximum": 120.0},
+            },
+            "required": ["host", "user", "path"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _ssh_write_file_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "ssh_write_file",
+        "description": "Write/append a UTF-8 text file to a remote host over SSH (non-interactive).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Remote host (e.g. omrijsharon.local)."},
+                "user": {"type": "string", "description": "SSH username (e.g. omrijsharon)."},
+                "path": {"type": "string", "description": "Remote file path to write (POSIX path)."},
+                "content": {"type": "string", "description": "UTF-8 text content to write."},
+                "append": {"type": "boolean", "description": "Append instead of overwrite.", "default": False},
+                "sudo": {
+                    "type": "boolean",
+                    "description": "Use sudo (non-interactive: sudo -n). Fails if a password is required.",
+                    "default": False,
+                },
+                "timeout_s": {"type": "number", "description": "SSH command timeout seconds.", "default": 30.0, "minimum": 1.0, "maximum": 120.0},
+            },
+            "required": ["host", "user", "path", "content"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _ssh_replace_line_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "ssh_replace_line",
+        "description": "Replace an exact line in a remote text file over SSH (non-interactive). Useful for config edits like commenting/uncommenting.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Remote host (e.g. omrijsharon.local)."},
+                "user": {"type": "string", "description": "SSH username (e.g. omrijsharon)."},
+                "path": {"type": "string", "description": "Remote file path to edit (POSIX path)."},
+                "old_line": {
+                    "type": "string",
+                    "description": "Exact line text to replace (without trailing newline).",
+                },
+                "new_line": {
+                    "type": "string",
+                    "description": "Replacement line text (without trailing newline).",
+                },
+                "occurrences": {
+                    "type": "string",
+                    "description": "Whether to replace the first match or all matches.",
+                    "enum": ["first", "all"],
+                    "default": "first",
+                },
+                "expected_matches": {
+                    "type": "integer",
+                    "description": "If provided, fail unless the number of matches equals this value.",
+                    "minimum": 0,
+                },
+                "sudo": {
+                    "type": "boolean",
+                    "description": "Use sudo (non-interactive: sudo -n). Fails if a password is required.",
+                    "default": False,
+                },
+                "timeout_s": {"type": "number", "description": "SSH command timeout seconds.", "default": 30.0, "minimum": 1.0, "maximum": 120.0},
+            },
+            "required": ["host", "user", "path", "old_line", "new_line"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _ssh_base_args(*, user: str, host: str) -> list[str]:
+    return [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        "BatchMode=yes",
+        f"{user}@{host}",
+    ]
+
+
+def _ssh_read_file_handler(args: JsonDict) -> str:
+    host = args.get("host")
+    user = args.get("user")
+    path = args.get("path")
+    sudo = bool(args.get("sudo", False))
+    max_chars = int(args.get("max_chars", 40000))
+    timeout_s = float(args.get("timeout_s", 20.0))
+
+    if not isinstance(host, str) or not host.strip():
+        return json.dumps({"ok": False, "error": "host must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(user, str) or not user.strip():
+        return json.dumps({"ok": False, "error": "user must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(path, str) or not path.strip():
+        return json.dumps({"ok": False, "error": "path must be a non-empty string"}, ensure_ascii=False)
+    max_chars = max(1, min(200000, max_chars))
+    timeout_s = max(1.0, min(120.0, timeout_s))
+
+    qpath = shlex.quote(path)
+    remote_cmd = f"{'sudo -n ' if sudo else ''}cat -- {qpath}"
+    cmd = _ssh_base_args(user=user.strip(), host=host.strip()) + [remote_cmd]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": "ssh not found on PATH"}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "error": f"ssh_read_file timed out after {timeout_s}s"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+    stdout = cp.stdout or ""
+    stderr = cp.stderr or ""
+    truncated = False
+    if len(stdout) > max_chars:
+        stdout = stdout[:max_chars]
+        truncated = True
+    if cp.returncode != 0:
+        return json.dumps(
+            {"ok": False, "returncode": cp.returncode, "stdout": stdout, "stderr": stderr, "truncated": truncated},
+            ensure_ascii=False,
+        )
+    return json.dumps({"ok": True, "text": stdout, "truncated": truncated}, ensure_ascii=False)
+
+
+def _ssh_write_file_handler(args: JsonDict) -> str:
+    host = args.get("host")
+    user = args.get("user")
+    path = args.get("path")
+    content = args.get("content")
+    append = bool(args.get("append", False))
+    sudo = bool(args.get("sudo", False))
+    timeout_s = float(args.get("timeout_s", 30.0))
+
+    if not isinstance(host, str) or not host.strip():
+        return json.dumps({"ok": False, "error": "host must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(user, str) or not user.strip():
+        return json.dumps({"ok": False, "error": "user must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(path, str) or not path.strip():
+        return json.dumps({"ok": False, "error": "path must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(content, str):
+        return json.dumps({"ok": False, "error": "content must be a string"}, ensure_ascii=False)
+    timeout_s = max(1.0, min(120.0, timeout_s))
+
+    mode = "ab" if append else "wb"
+    qpath = shlex.quote(path)
+    remote_cmd = (
+        f"{'sudo -n ' if sudo else ''}python3 -c "
+        + shlex.quote(
+            "import sys,base64; p=sys.argv[1]; mode=sys.argv[2]; data=base64.b64decode(sys.stdin.buffer.read()); "
+            "f=open(p, mode); f.write(data); f.close(); print('ok')"
+        )
+        + f" {qpath} {shlex.quote(mode)}"
+    )
+    cmd = _ssh_base_args(user=user.strip(), host=host.strip()) + [remote_cmd]
+    payload = (content or "").encode("utf-8")
+    b64 = __import__("base64").b64encode(payload)  # avoid global import in UI module
+    try:
+        cp = subprocess.run(cmd, input=b64, capture_output=True, text=False, timeout=timeout_s, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": "ssh not found on PATH"}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "error": f"ssh_write_file timed out after {timeout_s}s"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+    stdout = (cp.stdout or b"").decode("utf-8", errors="replace")
+    stderr = (cp.stderr or b"").decode("utf-8", errors="replace")
+    if cp.returncode != 0:
+        return json.dumps({"ok": False, "returncode": cp.returncode, "stdout": stdout, "stderr": stderr}, ensure_ascii=False)
+    return json.dumps({"ok": True, "stdout": stdout.strip()}, ensure_ascii=False)
+
+
+def _ssh_replace_line_handler(args: JsonDict) -> str:
+    host = args.get("host")
+    user = args.get("user")
+    path = args.get("path")
+    old_line = args.get("old_line")
+    new_line = args.get("new_line")
+    occurrences = args.get("occurrences", "first")
+    expected_matches = args.get("expected_matches", None)
+    sudo = bool(args.get("sudo", False))
+    timeout_s = float(args.get("timeout_s", 30.0))
+
+    if not isinstance(host, str) or not host.strip():
+        return json.dumps({"ok": False, "error": "host must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(user, str) or not user.strip():
+        return json.dumps({"ok": False, "error": "user must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(path, str) or not path.strip():
+        return json.dumps({"ok": False, "error": "path must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(old_line, str):
+        return json.dumps({"ok": False, "error": "old_line must be a string"}, ensure_ascii=False)
+    if not isinstance(new_line, str):
+        return json.dumps({"ok": False, "error": "new_line must be a string"}, ensure_ascii=False)
+    if occurrences not in ("first", "all"):
+        return json.dumps({"ok": False, "error": "occurrences must be 'first' or 'all'"}, ensure_ascii=False)
+    if expected_matches is not None:
+        try:
+            expected_matches = int(expected_matches)
+        except Exception:
+            return json.dumps({"ok": False, "error": "expected_matches must be an integer"}, ensure_ascii=False)
+        if expected_matches < 0:
+            return json.dumps({"ok": False, "error": "expected_matches must be >= 0"}, ensure_ascii=False)
+    timeout_s = max(1.0, min(120.0, timeout_s))
+
+    payload = {
+        "path": str(path),
+        "old_line": old_line,
+        "new_line": new_line,
+        "occurrences": occurrences,
+        "expected_matches": expected_matches,
+    }
+    code = (
+        "import sys, json, base64\n"
+        "p = json.loads(base64.b64decode(sys.stdin.buffer.read()).decode('utf-8'))\n"
+        "path = p['path']\n"
+        "old = p['old_line']\n"
+        "new = p['new_line']\n"
+        "occ = p.get('occurrences','first')\n"
+        "exp = p.get('expected_matches', None)\n"
+        "with open(path, 'r', encoding='utf-8', newline='') as f:\n"
+        "    data = f.read()\n"
+        "lines = data.splitlines(True)\n"
+        "matches = 0\n"
+        "out = []\n"
+        "replaced = False\n"
+        "for line in lines:\n"
+        "    nl = ''\n"
+        "    core = line\n"
+        "    if core.endswith('\\r\\n'):\n"
+        "        core, nl = core[:-2], '\\r\\n'\n"
+        "    elif core.endswith('\\n'):\n"
+        "        core, nl = core[:-1], '\\n'\n"
+        "    if core == old and (occ == 'all' or not replaced):\n"
+        "        matches += 1\n"
+        "        out.append(new + nl)\n"
+        "        replaced = True\n"
+        "    else:\n"
+        "        out.append(line)\n"
+        "if exp is not None and matches != exp:\n"
+        "    print(json.dumps({'ok': False, 'error': 'expected_matches_mismatch', 'matches': matches, 'expected_matches': exp}))\n"
+        "    raise SystemExit(2)\n"
+        "if matches == 0:\n"
+        "    print(json.dumps({'ok': False, 'error': 'no_match', 'matches': 0}))\n"
+        "    raise SystemExit(3)\n"
+        "with open(path, 'w', encoding='utf-8', newline='') as f:\n"
+        "    f.write(''.join(out))\n"
+        "print(json.dumps({'ok': True, 'matches': matches, 'occurrences': occ}))\n"
+    )
+    remote_cmd = f"{'sudo -n ' if sudo else ''}python3 -c {shlex.quote(code)}"
+    cmd = _ssh_base_args(user=user.strip(), host=host.strip()) + [remote_cmd]
+    b64 = __import__("base64").b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    try:
+        cp = subprocess.run(cmd, input=b64, capture_output=True, text=False, timeout=timeout_s, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": "ssh not found on PATH"}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "error": f"ssh_replace_line timed out after {timeout_s}s"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+    stdout = (cp.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (cp.stderr or b"").decode("utf-8", errors="replace").strip()
+    if cp.returncode != 0:
+        # Best-effort: surface remote JSON if present.
+        try:
+            j = json.loads(stdout) if stdout.startswith("{") else None
+        except Exception:
+            j = None
+        if isinstance(j, dict) and j.get("ok") is False:
+            j["returncode"] = cp.returncode
+            if stderr:
+                j["stderr"] = stderr
+            return json.dumps(j, ensure_ascii=False)
+        return json.dumps({"ok": False, "returncode": cp.returncode, "stdout": stdout, "stderr": stderr}, ensure_ascii=False)
+    try:
+        j = json.loads(stdout) if stdout.startswith("{") else {"ok": True, "stdout": stdout}
+    except Exception:
+        j = {"ok": True, "stdout": stdout}
+    return json.dumps(j, ensure_ascii=False)
 
 
 def _peer_agent_ask_tool_spec() -> JsonDict:
@@ -890,7 +1201,7 @@ class _Worker(QtCore.QThread):
                 self.signals.tool_msg.emit(f"[terminal] executing {len(blocks)} block(s)…")
                 results: list[CommandResult] = []
                 # Keep only the most recent <Terminal> block as context, with a rolling line window.
-                latest_window = _truncate_terminal_lines(blocks[-1], max_lines=20)
+                latest_window = _truncate_terminal_lines(blocks[-1], max_lines=200)
 
                 for b in blocks:
                     if self.isInterruptionRequested():
@@ -1036,6 +1347,12 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 "- `TerminalExec`: emit a <Terminal>...</Terminal> block (the contents will be executed in the attached interactive PowerShell terminal via ConPTY).\n"
                 "- `web_search`: search the web for up-to-date information.\n"
                 "- `wait(seconds)`: waits up to 5 seconds when you need to pause for a dependency/process instead of repeatedly checking.\n"
+                "\n"
+                "SSH file editing tools (use these when you need to read/edit remote files over SSH, especially if interactive editors like nano/vim are hard to drive):\n"
+                "- `ssh_read_file(host, user, path, sudo=False)`: read a remote text file.\n"
+                "- `ssh_write_file(host, user, path, content, append=False, sudo=False)`: overwrite/append a remote text file.\n"
+                "- `ssh_replace_line(host, user, path, old_line, new_line, occurrences='first', expected_matches=...)`: safe exact-line replace (good for toggling config lines like commenting/uncommenting).\n"
+                "  Note: when `sudo=True`, these use `sudo -n` (non-interactive) and will fail if a password prompt would be required.\n"
                 "- `peer_agent_ask(peer_name, message)`: ask another terminal-tab agent for help.\n"
                 "- `peer_terminal_run(peer_name, command)`: run a command in another terminal tab.\n"
                 "\n"
@@ -1056,6 +1373,15 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         )
         try:
             s.registry.add(tool_spec=_wait_tool_spec(), handler=_wait_tool_handler)
+        except Exception:
+            pass
+        try:
+            s.registry.add(tool_spec=_ssh_read_file_tool_spec(), handler=_ssh_read_file_handler)
+            s.registry.add(tool_spec=_ssh_write_file_tool_spec(), handler=_ssh_write_file_handler)
+        except Exception:
+            pass
+        try:
+            s.registry.add(tool_spec=_ssh_replace_line_tool_spec(), handler=_ssh_replace_line_handler)
         except Exception:
             pass
         return s

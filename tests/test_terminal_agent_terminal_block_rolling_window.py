@@ -32,11 +32,11 @@ def test_sanitize_terminal_blocks_truncates_to_last_20_lines() -> None:
         _msg("assistant", "a\n<Terminal>\nold\n</Terminal>\n"),
     ]
 
-    latest = "\n".join([f"line{i}" for i in range(1, 26)])
+    latest = "\n".join([f"line{i}" for i in range(1, 221)])
     _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=latest)
 
     txt = conv[1]["content"][0]["text"]
     assert "\nline1\n" not in txt
-    assert "\nline5\n" not in txt
-    assert "\nline6\n" in txt
-    assert "\nline25\n" in txt
+    assert "\nline20\n" not in txt
+    assert "\nline21\n" in txt
+    assert "\nline220\n" in txt
