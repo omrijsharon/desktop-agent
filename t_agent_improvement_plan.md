@@ -141,19 +141,22 @@
 
 ### Phase 1: Critical Fixes (Low effort, high impact)
 
-#### 1.1 Fix broken SSH detection regex
+#### - [x] 1.1 Fix broken SSH detection regex ✅ 2026-02-25T10:00Z
+
 **Files**: `terminal_agent_ui.py`  
 **What**: Fix `r"(?is)^ssh\\b"` → `r"(?is)^ssh\b"` in both `_is_interactive_ssh` and `_looks_like_interactive_ssh`. Same fix for the quote-detection regex `r"(?s)(?:\\\"|\\')"` → `r'(?s)(?:"|\')'`.  
 **Impact**: SSH sessions will be correctly detected at start, not just via banner heuristic.
 
-#### 1.2 Expose SSH state in `Terminal state:` context
+#### - [x] 1.2 Expose SSH state in `Terminal state:` context ✅ 2026-02-25T10:00Z (session_status + SSH context line in pending_user)
+
 **Files**: `terminal_agent_ui.py` (`_ConptyTerminal.session_status`, `_Worker.run`)  
 **What**:
 - `_ConptyTerminal.session_status()` should return `"ssh:connected"` when `_in_ssh` is `True`, and `"local(powershell)"` otherwise.
 - When constructing `pending_user`, inject a clear line: `"You are currently inside an SSH session on the remote host."` or `"You are on the local Windows machine."`.  
 **Impact**: The model will always know where it is.
 
-#### 1.3 Stronger continuation prompt
+#### - [x] 1.3 Stronger continuation prompt ✅ 2026-02-25T11:00Z
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run`)  
 **What**: Replace the weak continuation prompt with:
 ```
@@ -171,14 +174,16 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 ```
 **Impact**: Dramatically reduces premature stops and "which option do you prefer?" questions.
 
-#### 1.4 Increase `max_rounds` for SSH-heavy workflows
+#### - [x] 1.4 Increase `max_rounds` for SSH-heavy workflows ✅ 2026-02-25T11:00Z (6→12)
+
 **Files**: `terminal_agent_ui.py` (`_on_send`)  
 **What**: Increase `max_rounds` from 6 to 12 (or make it configurable via env var / system prompt).  
 **Impact**: Complex SSH tasks can run to completion without the agent running out of budget.
 
 ### Phase 2: Token Efficiency (Medium effort, high impact)
 
-#### 2.1 Aggressive conversation compaction
+#### - [ ] 2.1 Aggressive conversation compaction
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run`), potentially `chat_session.py`  
 **What**:
 - Before each `send_stream`, count estimated prompt tokens. If above a threshold (e.g., 60% of context window), summarize older turns.
@@ -186,7 +191,8 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 - As a simpler first step: just drop all but the last N turns (e.g., keep last 4 user/assistant pairs + system prompt). This alone would cut tokens by 50%+ in long sessions.  
 **Impact**: 2–5× token reduction in multi-round sessions.
 
-#### 2.2 Smarter stdout truncation
+#### - [x] 2.2 Smarter stdout truncation ✅ 2026-02-25T11:00Z (head+tail with _head_tail_truncate)
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run`)  
 **What**:
 - Keep the **first 40 lines** + **last 80 lines** (head + tail) instead of just the last 200 lines. Errors often appear at the top (compilation) or bottom (runtime). The middle is usually progress spam.
@@ -194,7 +200,8 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 - For commands that produce very large output, add a hint: `"(output truncated; {total_lines} total lines, showing first 40 + last 80)"`.  
 **Impact**: Model gets more useful signal per token spent.
 
-#### 2.3 Strip terminal noise from history
+#### - [ ] 2.3 Strip terminal noise from history
+
 **Files**: `terminal_agent_ui.py`  
 **What**:
 - Before injecting `<TerminalResponse>`, strip PowerShell prompt lines, ANSI leftovers, and blank lines.
@@ -202,14 +209,16 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 - Strip common noise patterns: progress bars (`[=====>    ] 45%`), pip download progress, apt progress, etc.  
 **Impact**: 10–30% reduction in terminal response token size.
 
-#### 2.4 Don't repeat the system prompt in every round's context
+#### - [ ] 2.4 Don't repeat the system prompt in every round's context
+
 **Files**: `terminal_agent_ui.py` (`_make_session`)  
 **What**: The system prompt is already passed via `instructions=` in the API call (not as a conversation item). Verify it's not duplicated. Trim the system prompt itself – remove the SSH example (`ssh -X omrijsharon@omrijsharon.local`) and other user-specific content from the _default_ prompt; put those in the prompt override instead.  
 **Impact**: ~200 tokens saved per API call.
 
 ### Phase 3: SSH Robustness (Medium effort, high impact)
 
-#### 3.1 Persistent SSH context header
+#### - [ ] 3.1 Persistent SSH context header
+
 **Files**: `terminal_agent_ui.py`  
 **What**: When the terminal is in SSH mode, prepend a structured context block to every `pending_user`:
 ```
@@ -224,7 +233,8 @@ Remote CWD: /home/omrijsharon
 Populate this by parsing the SSH command and periodically running `whoami && hostname && pwd` in the background (or after each command). Cache the result.  
 **Impact**: Model always knows exactly where it is and what the remote environment looks like.
 
-#### 3.2 Add `ssh_run_command` tool (one-shot remote execution)
+#### - [ ] 3.2 Add `ssh_run_command` tool (one-shot remote execution)
+
 **Files**: `terminal_agent_ui.py`  
 **What**: A new tool that runs a single command on the remote host via a _fresh_ SSH connection (like `ssh_read_file` but for arbitrary commands). Returns stdout/stderr/exit_code. This is more reliable than typing into the ConPTY session for commands that don't need interactivity.
 ```json
@@ -241,12 +251,14 @@ Populate this by parsing the SSH command and periodically running `whoami && hos
 ```
 **Impact**: Model gets a reliable, deterministic way to run remote commands without ConPTY timing/idle heuristics.
 
-#### 3.3 Add `ssh_patch_file` tool (regex-based)
+#### - [ ] 3.3 Add `ssh_patch_file` tool (regex-based)
+
 **Files**: `terminal_agent_ui.py`  
 **What**: Like `ssh_replace_line` but using regex patterns instead of exact-line matching. More robust for config file edits. Implement via `sed -i` or a Python one-liner on the remote.  
 **Impact**: Eliminates the most common SSH file editing failure mode (whitespace mismatches).
 
-#### 3.4 Improve `_in_ssh` detection robustness
+#### - [ ] 3.4 Improve `_in_ssh` detection robustness
+
 **Files**: `terminal_agent_ui.py` (`_ConptyTerminal`)  
 **What**:
 - After sending an SSH command, wait up to 10 seconds (not just 450 ms) for the remote prompt to appear before returning.
@@ -256,7 +268,8 @@ Populate this by parsing the SSH command and periodically running `whoami && hos
 
 ### Phase 4: Autonomous Problem-Solving (Medium effort, very high impact)
 
-#### 4.1 Error-retry nudge (self-reflection)
+#### - [x] 4.1 Error-retry nudge (self-reflection) ✅ 2026-02-25T11:00Z
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run`)  
 **What**: After receiving terminal output, check for common failure patterns (non-zero exit code, error keywords like `"Error"`, `"Permission denied"`, `"command not found"`, `"No such file"`). If detected, append an extra nudge to `pending_user`:
 ```
@@ -265,7 +278,8 @@ Analyze the error, determine the fix, and continue. Do NOT stop to ask the user.
 ```
 **Impact**: Model retries failures instead of stopping and asking the user.
 
-#### 4.2 Self-verification step
+#### - [ ] 4.2 Self-verification step
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run`)  
 **What**: Before declaring a task done (no `<Terminal>` blocks in output), inject a verification prompt:
 ```
@@ -278,7 +292,8 @@ Only summarize if everything is confirmed working.
 This uses one extra round but catches incomplete work.  
 **Impact**: Dramatically reduces "it says it's done but it's not" scenarios.
 
-#### 4.3 Single-agent deliberation (internal chain-of-thought before acting)
+#### - [x] 4.3 Single-agent deliberation (internal chain-of-thought before acting) ✅ 2026-02-25T11:00Z
+
 **Files**: `terminal_agent_ui.py` (`_Worker.run` and system prompt)  
 **What**: Instead of spawning a second agent for brainstorming, add a structured thinking protocol to the system prompt:
 ```
@@ -292,7 +307,8 @@ Do NOT ask the user which option to choose unless ALL options have been tried an
 This is lighter than multi-agent and works within the existing single-agent loop.  
 **Impact**: Eliminates most "which approach do you prefer?" pauses without any code changes beyond the prompt.
 
-#### 4.4 Persistent session scratchpad
+#### - [ ] 4.4 Persistent session scratchpad
+
 **Files**: `terminal_agent_ui.py`, `chat_session.py`  
 **What**: Give the model a `scratchpad` tool that stores key-value notes across rounds. The scratchpad is injected into every prompt as a compact block:
 ```
@@ -308,22 +324,26 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 
 ### Phase 5: Quality of Life (Low effort, nice to have)
 
-#### 5.1 Show SSH status in UI
+#### - [ ] 5.1 Show SSH status in UI
+
 **Files**: `terminal_agent_ui.py` (UI)  
 **What**: Add an indicator in the terminal tab header or CWD label showing `🟢 SSH: pi@raspberrypi` or `⚪ Local`.  
 **Impact**: User always knows terminal state at a glance.
 
-#### 5.2 Configurable `max_rounds` via UI
+#### - [ ] 5.2 Configurable `max_rounds` via UI
+
 **Files**: `terminal_agent_ui.py`  
 **What**: Add a small spinbox or dropdown near the Send button to set rounds (6 / 12 / 20 / unlimited).  
 **Impact**: User can give the agent more autonomy for big tasks.
 
-#### 5.3 "Continue" button
+#### - [ ] 5.3 "Continue" button
+
 **Files**: `terminal_agent_ui.py`  
 **What**: When the model stops (no `<Terminal>` blocks), show a "Continue" button in the chat that sends `"Continue with the task. If there are remaining steps, execute them."` as the next user message.  
 **Impact**: One-click recovery from premature stops.
 
-#### 5.4 Token usage chart
+#### - [ ] 5.4 Token usage chart
+
 **Files**: `terminal_agent_ui.py` (UI)  
 **What**: Show a small bar chart or color-coded indicator of token usage relative to the context window. Turn orange at 60%, red at 80%.  
 **Impact**: User can see when to expect degraded performance and proactively reset.
@@ -332,28 +352,28 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 
 ## 4. Priority & Ordering
 
-| Priority | Item | Effort | Impact |
-|----------|------|--------|--------|
-| 🔴 P0 | 1.1 Fix SSH regex | 5 min | Critical bug fix |
-| 🔴 P0 | 1.2 Expose SSH state | 30 min | Fixes local/remote confusion |
-| 🔴 P0 | 1.3 Stronger continuation prompt | 15 min | Fixes premature stops |
-| 🟠 P1 | 1.4 Increase max_rounds | 5 min | More autonomy |
-| 🟠 P1 | 4.3 Single-agent deliberation prompt | 15 min | Stops "which option?" pauses |
-| 🟠 P1 | 2.2 Smarter stdout truncation | 30 min | Token efficiency |
-| 🟠 P1 | 4.1 Error-retry nudge | 30 min | Auto-recovery from failures |
-| 🟡 P2 | 2.1 Conversation compaction | 2 hr | Major token savings |
-| 🟡 P2 | 3.1 SSH context header | 1 hr | SSH robustness |
-| 🟡 P2 | 2.3 Strip terminal noise | 1 hr | Token efficiency |
-| 🟡 P2 | 3.2 ssh_run_command tool | 1 hr | Reliable remote commands |
-| 🟡 P2 | 4.2 Self-verification step | 30 min | Task completion quality |
-| 🟢 P3 | 3.3 ssh_patch_file tool | 1 hr | SSH file editing |
-| 🟢 P3 | 3.4 Improve _in_ssh detection | 1 hr | SSH robustness |
-| 🟢 P3 | 4.4 Persistent scratchpad | 2 hr | Long-session memory |
-| 🟢 P3 | 5.1 SSH status in UI | 30 min | UX |
-| 🟢 P3 | 5.3 "Continue" button | 30 min | UX |
-| ⚪ P4 | 5.2 Configurable max_rounds | 15 min | UX |
-| ⚪ P4 | 5.4 Token usage chart | 1 hr | UX |
-| ⚪ P4 | 2.4 System prompt cleanup | 15 min | Minor token savings |
+| Priority | Item | Effort | Impact | Done |
+|----------|------|--------|--------|------|
+| 🔴 P0 | 1.1 Fix SSH regex | 5 min | Critical bug fix | ✅ |
+| 🔴 P0 | 1.2 Expose SSH state | 30 min | Fixes local/remote confusion | ✅ |
+| 🔴 P0 | 1.3 Stronger continuation prompt | 15 min | Fixes premature stops | ✅ |
+| 🟠 P1 | 1.4 Increase max_rounds | 5 min | More autonomy | ✅ |
+| 🟠 P1 | 4.3 Single-agent deliberation prompt | 15 min | Stops "which option?" pauses | ✅ |
+| 🟠 P1 | 2.2 Smarter stdout truncation | 30 min | Token efficiency | ✅ |
+| 🟠 P1 | 4.1 Error-retry nudge | 30 min | Auto-recovery from failures | ✅ |
+| 🟡 P2 | 2.1 Conversation compaction | 2 hr | Major token savings | |
+| 🟡 P2 | 3.1 SSH context header | 1 hr | SSH robustness | |
+| 🟡 P2 | 2.3 Strip terminal noise | 1 hr | Token efficiency | |
+| 🟡 P2 | 3.2 ssh_run_command tool | 1 hr | Reliable remote commands | |
+| 🟡 P2 | 4.2 Self-verification step | 30 min | Task completion quality | |
+| 🟢 P3 | 3.3 ssh_patch_file tool | 1 hr | SSH file editing | |
+| 🟢 P3 | 3.4 Improve _in_ssh detection | 1 hr | SSH robustness | |
+| 🟢 P3 | 4.4 Persistent scratchpad | 2 hr | Long-session memory | |
+| 🟢 P3 | 5.1 SSH status in UI | 30 min | UX | |
+| 🟢 P3 | 5.3 "Continue" button | 30 min | UX | |
+| ⚪ P4 | 5.2 Configurable max_rounds | 15 min | UX | |
+| ⚪ P4 | 5.4 Token usage chart | 1 hr | UX | |
+| ⚪ P4 | 2.4 System prompt cleanup | 15 min | Minor token savings | |
 
 **Recommended execution order**: P0 items first (can all be done in one session), then P1 (another session), then P2/P3 as needed.
 

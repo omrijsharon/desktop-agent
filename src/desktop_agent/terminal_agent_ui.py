@@ -139,6 +139,30 @@ def _truncate_terminal_lines(text: str, *, max_lines: int = 200) -> str:
     return "\n".join(lines).strip("\n")
 
 
+def _head_tail_truncate(text: str, *, max_chars: int = 4000,
+                        head_lines: int = 40, tail_lines: int = 80) -> str:
+    """Keep the first *head_lines* and last *tail_lines* of *text*.
+
+    Errors often appear at the top (compilation) or bottom (runtime).
+    The middle is usually progress spam.  Also enforces a char cap.
+    """
+    if not text:
+        return text
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    total = len(lines)
+    keep = head_lines + tail_lines
+    if total > keep:
+        omitted = total - keep
+        text = (
+            "\n".join(lines[:head_lines])
+            + f"\n\n…({omitted} lines omitted, {total} total)…\n\n"
+            + "\n".join(lines[-tail_lines:])
+        )
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…(truncated)…"
+    return text
+
+
 def _sanitize_terminal_blocks_in_conversation(
     conversation_items: list[JsonDict], *, latest_terminal_window: str | None
 ) -> list[JsonDict]:
@@ -1332,10 +1356,9 @@ class _Worker(QtCore.QThread):
                 for res in results:
                     so = (res.stdout or "").strip()
                     se = (res.stderr or "").strip()
-                    if len(so) > 6000:
-                        so = so[:6000] + "\n…(truncated)…"
-                    if len(se) > 2000:
-                        se = se[:2000] + "\n…(truncated)…"
+                    # --- 2.2 smarter stdout truncation: head + tail ---
+                    so = _head_tail_truncate(so, max_chars=4000, head_lines=40, tail_lines=80)
+                    se = _head_tail_truncate(se, max_chars=2000, head_lines=20, tail_lines=40)
                     parts.append(
                         "Command:\n"
                         + res.command
@@ -1359,13 +1382,45 @@ class _Worker(QtCore.QThread):
                     term_state = str(getattr(self.terminal, "session_status", lambda: "interactive")())
                 except Exception:
                     term_state = "interactive"
+
+                # --- 1.2 explicit SSH context line ---
+                ssh_context = ""
+                if "ssh" in term_state.lower():
+                    ssh_context = "You are currently inside an SSH session on the remote host.\n"
+                else:
+                    ssh_context = "You are on the local Windows machine.\n"
+
+                # --- 4.1 error-retry nudge ---
+                error_nudge = ""
+                _error_keywords = ("error", "permission denied", "command not found",
+                                   "no such file", "failed", "fatal", "traceback",
+                                   "exception", "denied", "not recognized")
+                for res in results:
+                    _ec = res.exit_code
+                    _combined = ((res.stdout or "") + (res.stderr or "")).lower()
+                    if (isinstance(_ec, int) and _ec != 0) or any(k in _combined for k in _error_keywords):
+                        error_nudge = (
+                            "\nNOTE: The last command appears to have FAILED "
+                            "(non-zero exit code or error detected). "
+                            "Analyze the error, determine the fix, and continue. "
+                            "Do NOT stop to ask the user.\n"
+                        )
+                        break
+
                 full_resp = "Terminal command results:\n\n" + "\n---\n".join(parts)
                 full_resp = _truncate_terminal_lines(full_resp, max_lines=200)
+                rounds_remaining = max(0, self.max_rounds - (_r + 1))
+                # --- 1.3 stronger continuation prompt ---
                 pending_user = (
-                    f"Terminal state: {term_state}\n\n"
+                    f"Terminal state: {term_state}\n"
+                    f"{ssh_context}\n"
                     f"<TerminalResponse>\n{full_resp}\n</TerminalResponse>\n\n"
-                    "If you need to run more commands, respond with more <Terminal>...</Terminal> blocks. "
-                    "Otherwise, reply normally to the user with a summary of what happened.\n"
+                    f"IMPORTANT: You have {rounds_remaining} round(s) remaining.\n"
+                    "- If the task is NOT yet complete, continue by emitting more <Terminal>...</Terminal> blocks.\n"
+                    "- If you encountered an error, try to fix it instead of stopping.\n"
+                    "- Do NOT ask the user to choose between options – pick the best approach yourself and proceed.\n"
+                    "- Only reply with a summary to the user when you are confident the task is fully done.\n"
+                    f"{error_nudge}"
                 )
         except Exception as e:  # noqa: BLE001
             self.signals.error.emit(f"{type(e).__name__}: {e}")
@@ -1483,6 +1538,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
             "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
             "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
+            "\n"
+            "Problem-solving protocol:\n"
+            "- When you encounter a problem with multiple possible solutions, think through the options briefly "
+            "(2-3 sentences max per option), pick the most likely to succeed, and execute it.\n"
+            "- If it fails, try the next option. Do NOT ask the user which option to choose unless ALL options "
+            "have been tried and failed.\n"
+            "- If a command fails, analyze the error, determine the fix, and continue autonomously.\n"
             "\n"
             "Collaboration:\n"
             "- You can ask other terminal-tab agents for help with `peer_agent_ask(peer_name, message)`.\n"
@@ -2179,7 +2241,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             session=st.session,
             user_text=text,
             terminal=st.terminal,
-            max_rounds=6,
+            max_rounds=12,
             hide_think=self._hide_think,
             parent=self,
         )
