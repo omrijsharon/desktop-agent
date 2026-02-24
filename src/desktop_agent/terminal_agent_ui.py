@@ -757,10 +757,10 @@ class _TerminalRunner:
         c = (cmd or "").strip()
         if not c:
             return False
-        if not re.match(r"(?is)^ssh\\b", c):
+        if not re.match(r"(?i)^ssh\b", c):
             return False
         # Heuristic: if it contains a quoted remote command, treat as non-interactive.
-        if re.search(r"(?s)(?:\\\"|\\')", c):
+        if re.search(r"""(?s)(?:"|')""", c):
             return False
         return True
 
@@ -1150,10 +1150,10 @@ class _ConptyTerminal:
 
     def _looks_like_interactive_ssh(self, cmd: str) -> bool:
         c = (cmd or "").strip()
-        if not re.match(r"(?is)^ssh\\b", c):
+        if not re.match(r"(?i)^ssh\b", c):
             return False
         # If it contains quotes, assume non-interactive `ssh host "cmd"`.
-        return not bool(re.search(r"(?s)(?:\\\"|\\')", c))
+        return not bool(re.search(r"""(?s)(?:"|')""", c))
 
     def send_and_collect(self, *, block: str, idle_ms: int = 450, max_wait_s: float = 25.0) -> CommandResult:
         cmd = (block or "").strip()
@@ -1195,8 +1195,10 @@ class _ConptyTerminal:
         return CommandResult(command=cmd, exit_code=0, stdout=captured, stderr="", elapsed_s=float(elapsed), cwd_after=str(self.cwd))
 
     def session_status(self) -> str:
-        # With ConPTY, there's a single interactive terminal; it may contain SSH or anything else.
-        return "interactive(conpty)"
+        # Expose SSH state so the model knows if it's local or remote.
+        if self._in_ssh:
+            return "ssh:connected"
+        return "local(powershell)"
 
 
 class _Worker(QtCore.QThread):
