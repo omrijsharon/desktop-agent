@@ -10,6 +10,7 @@ Covers:
 - Error-retry nudge detection logic (4.1)
 - Deliberation prompt in system prompt (4.3)
 - max_rounds increased (1.4)
+- _compact_conversation (2.1 conversation compaction)
 """
 
 from __future__ import annotations
@@ -306,3 +307,101 @@ class TestSelfVerificationStep:
     def test_verified_flag_set(self) -> None:
         src = self._read_source()
         assert "_verified = True" in src, "Verification flag should be set after first use"
+
+
+# === 2.1 _compact_conversation ===
+
+
+class TestCompactConversation:
+    """Test conversation compaction logic."""
+
+    @staticmethod
+    def _make_mock_session(conv: list, ctx_tokens: int = 128_000):
+        """Create a minimal mock that looks like ChatSession."""
+
+        class _Cfg:
+            context_window_tokens = ctx_tokens
+
+        class _Mock:
+            cfg = _Cfg()
+            _conversation = conv
+
+            def estimate_prompt_tokens(self, *, user_text: str) -> int:
+                # Rough estimate: 4 chars per token
+                total = sum(
+                    len(p.get("text", ""))
+                    for item in self._conversation
+                    for p in (item.get("content") or [])
+                    if isinstance(p, dict)
+                )
+                return total // 4
+
+        return _Mock()
+
+    @staticmethod
+    def _make_turn(role: str, text: str) -> dict:
+        return {"role": role, "content": [{"type": "input_text", "text": text}]}
+
+    def test_no_compaction_when_small(self) -> None:
+        from desktop_agent.terminal_agent_ui import _compact_conversation
+
+        conv = [
+            self._make_turn("user", "hello"),
+            self._make_turn("assistant", "hi"),
+        ]
+        session = self._make_mock_session(conv)
+        _compact_conversation(session, keep_pairs=4)
+        assert len(conv) == 2  # unchanged
+
+    def test_no_compaction_when_under_threshold(self) -> None:
+        from desktop_agent.terminal_agent_ui import _compact_conversation
+
+        conv = [
+            self._make_turn("user", f"msg {i}") for i in range(20)
+        ]
+        # With small messages and 128k context, should be well under 60%
+        session = self._make_mock_session(conv, ctx_tokens=128_000)
+        _compact_conversation(session, keep_pairs=4)
+        assert len(conv) == 20  # unchanged
+
+    def test_compaction_when_over_threshold(self) -> None:
+        from desktop_agent.terminal_agent_ui import _compact_conversation
+
+        # Create a conversation that's very large relative to a tiny context window
+        big_text = "x" * 2000
+        conv = []
+        for i in range(20):
+            conv.append(self._make_turn("user", f"Q{i}: {big_text}"))
+            conv.append(self._make_turn("assistant", f"A{i}: {big_text}"))
+        # 40 items, each ~2000 chars = ~10000 tokens; set ctx to 12000 so 60% = 7200 < 10000
+        session = self._make_mock_session(conv, ctx_tokens=12_000)
+        _compact_conversation(session, keep_pairs=4)
+        # Should have: 1 summary + 8 kept items = 9
+        assert len(conv) == 9
+        # First item should be the summary placeholder
+        first_text = conv[0]["content"][0]["text"]
+        assert "older conversation turns were dropped" in first_text
+        # Last items should be the most recent
+        last_text = conv[-1]["content"][0]["text"]
+        assert "A19" in last_text
+
+    def test_compaction_keeps_recent_pairs(self) -> None:
+        from desktop_agent.terminal_agent_ui import _compact_conversation
+
+        big_text = "y" * 1000
+        conv = []
+        for i in range(10):
+            conv.append(self._make_turn("user", f"U{i} {big_text}"))
+            conv.append(self._make_turn("assistant", f"A{i} {big_text}"))
+        session = self._make_mock_session(conv, ctx_tokens=8_000)
+        _compact_conversation(session, keep_pairs=3)
+        # Should keep last 6 items + 1 summary = 7
+        assert len(conv) == 7
+        # Verify the kept items are the last 6
+        assert "U7" in conv[1]["content"][0]["text"]
+        assert "A9" in conv[-1]["content"][0]["text"]
+
+    def test_source_has_compact_call(self) -> None:
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "src" / "desktop_agent" / "terminal_agent_ui.py").read_text(encoding="utf-8")
+        assert "_compact_conversation" in src

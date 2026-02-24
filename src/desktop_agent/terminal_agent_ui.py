@@ -329,6 +329,50 @@ def _sanitize_terminal_responses_in_conversation(
     return conversation_items
 
 
+def _compact_conversation(session: "ChatSession", *, keep_pairs: int = 4) -> None:
+    """Drop older conversation turns if estimated prompt tokens exceed 60% of context window.
+
+    Keeps the most recent *keep_pairs* user/assistant turn pairs so the model
+    retains recent context. Older turns are replaced with a single summary
+    placeholder to avoid losing all context awareness.
+
+    This is a simple but effective approach: just drop old turns rather than
+    summarizing them (which would require an extra API call).
+    """
+    conv = getattr(session, "_conversation", None)
+    if not isinstance(conv, list) or len(conv) <= keep_pairs * 2:
+        return
+
+    max_ctx = int(getattr(getattr(session, "cfg", None), "context_window_tokens", 0) or 0)
+    if max_ctx <= 0:
+        return
+
+    # Estimate current token usage
+    try:
+        est = session.estimate_prompt_tokens(user_text="")
+    except Exception:
+        return
+
+    threshold = int(max_ctx * 0.60)
+    if est <= threshold:
+        return
+
+    # Drop oldest turns, keeping last keep_pairs*2 items
+    n_keep = keep_pairs * 2
+    if len(conv) <= n_keep:
+        return
+
+    dropped = len(conv) - n_keep
+    summary_msg = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": (
+            f"[System note: {dropped} older conversation turns were dropped to save context space. "
+            "The most recent exchanges are preserved below.]"
+        )}],
+    }
+    conv[:] = [summary_msg] + conv[-n_keep:]
+
+
 def _wait_tool_spec() -> JsonDict:
     return {
         "type": "function",
@@ -1347,6 +1391,15 @@ class _Worker(QtCore.QThread):
                     if isinstance(conv, list):
                         _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=None)
                         _sanitize_terminal_responses_in_conversation(conv, latest_terminal_response_window=None, max_lines=200)
+                except Exception:
+                    pass
+
+                # --- 2.1 conversation compaction ---
+                # If the conversation is getting long, drop older turns to stay
+                # within ~60% of the context window.  Keep the last N user/assistant
+                # pairs so the model retains recent context.
+                try:
+                    _compact_conversation(self.session, keep_pairs=4)
                 except Exception:
                     pass
 

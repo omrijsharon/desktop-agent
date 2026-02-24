@@ -182,7 +182,7 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 
 ### Phase 2: Token Efficiency (Medium effort, high impact)
 
-#### - [ ] 2.1 Aggressive conversation compaction
+#### - [x] 2.1 Aggressive conversation compaction ✅ 2026-02-25T12:30Z
 
 **Files**: `terminal_agent_ui.py` (`_Worker.run`), potentially `chat_session.py`  
 **What**:
@@ -361,7 +361,7 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 | 🟠 P1 | 4.3 Single-agent deliberation prompt | 15 min | Stops "which option?" pauses | ✅ |
 | 🟠 P1 | 2.2 Smarter stdout truncation | 30 min | Token efficiency | ✅ |
 | 🟠 P1 | 4.1 Error-retry nudge | 30 min | Auto-recovery from failures | ✅ |
-| 🟡 P2 | 2.1 Conversation compaction | 2 hr | Major token savings | |
+| 🟡 P2 | 2.1 Conversation compaction | 2 hr | Major token savings | ✅ |
 | 🟡 P2 | 3.1 SSH context header | 1 hr | SSH robustness | ✅ |
 | 🟡 P2 | 2.3 Strip terminal noise | 1 hr | Token efficiency | ✅ |
 | 🟡 P2 | 3.2 ssh_run_command tool | 1 hr | Reliable remote commands | |
