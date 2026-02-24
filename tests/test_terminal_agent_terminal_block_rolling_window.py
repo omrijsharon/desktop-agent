@@ -24,7 +24,7 @@ def test_sanitize_terminal_blocks_keeps_only_latest_block() -> None:
     assert "pwd" in last_text
 
 
-def test_sanitize_terminal_blocks_truncates_to_last_20_lines() -> None:
+def test_sanitize_terminal_blocks_keeps_latest_block_intact() -> None:
     from desktop_agent.terminal_agent_ui import _sanitize_terminal_blocks_in_conversation
 
     conv = [
@@ -36,7 +36,7 @@ def test_sanitize_terminal_blocks_truncates_to_last_20_lines() -> None:
     _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=latest)
 
     txt = conv[1]["content"][0]["text"]
-    assert "\nline1\n" not in txt
-    assert "\nline20\n" not in txt
+    assert "\nline1\n" in txt
+    assert "\nline20\n" in txt
     assert "\nline21\n" in txt
     assert "\nline220\n" in txt

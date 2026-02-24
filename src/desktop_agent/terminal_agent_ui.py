@@ -36,6 +36,7 @@ from .chat_ui import Bubble, _strip_think  # reuse bubble + think styling
 JsonDict = dict[str, Any]
 
 _TERM_BLOCK_RE = re.compile(r"(?is)<terminal>(.*?)</terminal>")
+_TERM_RESP_RE = re.compile(r"(?is)<terminalresponse>(.*?)</terminalresponse>")
 _ANSI_RE = re.compile(r"(?s)\x1b\[[0-?]*[ -/]*[@-~]")
 _OSC_RE = re.compile(r"(?s)\x1b\].*?(?:\x07|\x1b\\)")
 _PROMPT_SENTINEL = "__TA_PROMPT__"
@@ -49,6 +50,40 @@ class _UiBridge(QtCore.QObject):
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _terminal_agent_prompts_path(*, base_dir: Path) -> Path:
+    return (base_dir / "chat_history" / "terminal_agent_prompts.json").resolve()
+
+
+def _load_terminal_agent_prompt_overrides(*, base_dir: Path) -> dict[str, str]:
+    path = _terminal_agent_prompts_path(base_dir=base_dir)
+    try:
+        if not path.exists():
+            return {}
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and isinstance(v, str):
+                kk = k.strip()
+                if kk:
+                    out[kk] = v
+        return out
+    except Exception:
+        return {}
+
+
+def _save_terminal_agent_prompt_overrides(*, base_dir: Path, overrides: dict[str, str]) -> None:
+    path = _terminal_agent_prompts_path(base_dir=base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Only persist non-empty keys; values may be empty (meaning "clear"), but we don't store empties.
+    cleaned: dict[str, str] = {}
+    for k, v in (overrides or {}).items():
+        if isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip():
+            cleaned[k.strip()] = v
+    path.write_text(json.dumps(cleaned, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _load_qss() -> str:
@@ -134,7 +169,8 @@ def _sanitize_terminal_blocks_in_conversation(
         # window in-context while still preventing the history from growing unbounded.
         existing_blocks = extract_terminal_blocks(last_txt_with_block or "")
         latest = (existing_blocks[-1] if existing_blocks else "").strip()
-    latest = _truncate_terminal_lines(latest, max_lines=200) if latest else ""
+    # Commands are typically short; keep them intact (no rolling window truncation here).
+    latest = latest.strip()
 
     i_keep, j_keep = last_pos
     for i, item in enumerate(conversation_items):
@@ -152,6 +188,62 @@ def _sanitize_terminal_blocks_in_conversation(
             # Re-add only the latest rolling window on the last occurrence.
             if (i, j) == (i_keep, j_keep) and latest:
                 cleaned = (cleaned + "\n\n" if cleaned else "") + f"<Terminal>\n{latest}\n</Terminal>"
+            part["text"] = cleaned
+
+    return conversation_items
+
+
+def _strip_terminal_responses(text: str) -> str:
+    t = _TERM_RESP_RE.sub("", text or "")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def _sanitize_terminal_responses_in_conversation(
+    conversation_items: list[JsonDict], *, latest_terminal_response_window: str | None, max_lines: int = 200
+) -> list[JsonDict]:
+    """Keep only the latest <TerminalResponse> block in history (rolling line window)."""
+
+    last_pos: tuple[int, int] | None = None
+    last_txt_with_block: str | None = None
+    for i, item in enumerate(conversation_items):
+        contents = item.get("content")
+        if not isinstance(contents, list):
+            continue
+        for j, part in enumerate(contents):
+            if not isinstance(part, dict):
+                continue
+            txt = part.get("text")
+            if isinstance(txt, str) and _TERM_RESP_RE.search(txt or ""):
+                last_pos = (i, j)
+                last_txt_with_block = txt
+
+    if last_pos is None:
+        return conversation_items
+
+    latest = (latest_terminal_response_window or "").strip()
+    if latest_terminal_response_window is None:
+        # Preserve the most recent response already present.
+        m = None
+        for m in _TERM_RESP_RE.finditer(last_txt_with_block or ""):
+            pass
+        latest = ((m.group(1) if m else "") or "").strip()
+    latest = _truncate_terminal_lines(latest, max_lines=max_lines) if latest else ""
+
+    i_keep, j_keep = last_pos
+    for i, item in enumerate(conversation_items):
+        contents = item.get("content")
+        if not isinstance(contents, list):
+            continue
+        for j, part in enumerate(contents):
+            if not isinstance(part, dict):
+                continue
+            txt = part.get("text")
+            if not isinstance(txt, str) or not _TERM_RESP_RE.search(txt or ""):
+                continue
+            cleaned = _strip_terminal_responses(txt)
+            if (i, j) == (i_keep, j_keep) and latest:
+                cleaned = (cleaned + "\n\n" if cleaned else "") + f"<TerminalResponse>\n{latest}\n</TerminalResponse>"
             part["text"] = cleaned
 
     return conversation_items
@@ -1125,6 +1217,7 @@ class _Worker(QtCore.QThread):
         self.max_rounds = int(max_rounds)
         self.hide_think = hide_think
         self.signals = _Signals()
+        self._pause_flag = threading.Event()
 
     def request_stop(self) -> None:
         try:
@@ -1136,11 +1229,28 @@ class _Worker(QtCore.QThread):
         except Exception:
             pass
 
+    def request_soft_stop(self) -> None:
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._pause_flag.set()
+        else:
+            self._pause_flag.clear()
+
+    def _maybe_pause(self) -> None:
+        while self._pause_flag.is_set() and not self.isInterruptionRequested():
+            time.sleep(0.05)
+
     def run(self) -> None:  # type: ignore[override]
         self.signals.busy.emit(True)
         try:
             pending_user = self.user_text
             for _r in range(max(1, self.max_rounds)):
+                self._maybe_pause()
                 if self.isInterruptionRequested():
                     return
 
@@ -1149,6 +1259,7 @@ class _Worker(QtCore.QThread):
                     conv = getattr(self.session, "_conversation", None)
                     if isinstance(conv, list):
                         _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=None)
+                        _sanitize_terminal_responses_in_conversation(conv, latest_terminal_response_window=None, max_lines=200)
                 except Exception:
                     pass
 
@@ -1159,6 +1270,7 @@ class _Worker(QtCore.QThread):
                 max_ctx = int(getattr(self.session.cfg, "context_window_tokens", 0) or 0)
 
                 for ev in self.session.send_stream(pending_user):
+                    self._maybe_pause()
                     if self.isInterruptionRequested():
                         return
                     et = ev.get("type")
@@ -1186,6 +1298,7 @@ class _Worker(QtCore.QThread):
                         self.signals.error.emit(str(err))
                         return
 
+                self._maybe_pause()
                 if self.isInterruptionRequested():
                     return
 
@@ -1204,6 +1317,7 @@ class _Worker(QtCore.QThread):
                 latest_window = _truncate_terminal_lines(blocks[-1], max_lines=200)
 
                 for b in blocks:
+                    self._maybe_pause()
                     if self.isInterruptionRequested():
                         return
                     self.signals.terminal_append.emit(f"\nPS {getattr(self.terminal, 'cwd', '')}> {b}\n")
@@ -1243,11 +1357,11 @@ class _Worker(QtCore.QThread):
                     term_state = str(getattr(self.terminal, "session_status", lambda: "interactive")())
                 except Exception:
                     term_state = "interactive"
+                full_resp = "Terminal command results:\n\n" + "\n---\n".join(parts)
+                full_resp = _truncate_terminal_lines(full_resp, max_lines=200)
                 pending_user = (
                     f"Terminal state: {term_state}\n\n"
-                    "Terminal command results:\n\n"
-                    + "\n---\n".join(parts)
-                    + "\n\n"
+                    f"<TerminalResponse>\n{full_resp}\n</TerminalResponse>\n\n"
                     "If you need to run more commands, respond with more <Terminal>...</Terminal> blocks. "
                     "Otherwise, reply normally to the user with a summary of what happened.\n"
                 )
@@ -1267,6 +1381,7 @@ class _TabState:
     using_conpty: bool
     term_signals: _TermSignals
     worker: _Worker | None
+    paused: bool
     tokens_text: str
     # UI widgets (per tab)
     chat_scroll: QtWidgets.QScrollArea
@@ -1286,6 +1401,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._active_tab_id: str | None = None
         self._ui_bridge = _UiBridge(self)
         self._ui_bridge.append_chat.connect(self._on_append_chat, QtCore.Qt.ConnectionType.QueuedConnection)
+        self._prompt_overrides: dict[str, str] = _load_terminal_agent_prompt_overrides(base_dir=_repo_root())
 
         self._build_ui()
         self._apply_style()
@@ -1337,40 +1453,52 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             allow_submodels=True,
         )
         s = ChatSession(api_key=api_key, config=ccfg)
-        s.set_system_prompt(
-            (
-                f"You are Terminal Agent ({agent_name}), an assistant that can run PowerShell commands.\n"
-                "Your primary role is to use the terminal to help the user accomplish real tasks (not just give advice).\n"
-                "When you want to execute commands, emit a <Terminal>...</Terminal> block.\n"
-                "\n"
-                "Tools you can use:\n"
-                "- `TerminalExec`: emit a <Terminal>...</Terminal> block (the contents will be executed in the attached interactive PowerShell terminal via ConPTY).\n"
-                "- `web_search`: search the web for up-to-date information.\n"
-                "- `wait(seconds)`: waits up to 5 seconds when you need to pause for a dependency/process instead of repeatedly checking.\n"
-                "\n"
-                "SSH file editing tools (use these when you need to read/edit remote files over SSH, especially if interactive editors like nano/vim are hard to drive):\n"
-                "- `ssh_read_file(host, user, path, sudo=False)`: read a remote text file.\n"
-                "- `ssh_write_file(host, user, path, content, append=False, sudo=False)`: overwrite/append a remote text file.\n"
-                "- `ssh_replace_line(host, user, path, old_line, new_line, occurrences='first', expected_matches=...)`: safe exact-line replace (good for toggling config lines like commenting/uncommenting).\n"
-                "  Note: when `sudo=True`, these use `sudo -n` (non-interactive) and will fail if a password prompt would be required.\n"
-                "- `peer_agent_ask(peer_name, message)`: ask another terminal-tab agent for help.\n"
-                "- `peer_terminal_run(peer_name, command)`: run a command in another terminal tab.\n"
-                "\n"
-                "Anything inside <Terminal>...</Terminal> will be executed in the attached interactive PowerShell terminal (ConPTY).\n"
-                "This behaves like a real terminal: SSH is interactive and stays open, and you can run subsequent commands naturally.\n"
-                "Use `exit` to exit remote shells or close programs. The user can press Stop to reset the terminal.\n"
-                "\n"
-                "If the user asks to connect to the Pi / connect via SSH, prefer:\n"
-                "ssh -X omrijsharon@omrijsharon.local\n"
-                "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
-                "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
-                "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
-                "\n"
-                "Collaboration:\n"
-                "- You can ask other terminal-tab agents for help with `peer_agent_ask(peer_name, message)`.\n"
-                "- You can run a command in another tab with `peer_terminal_run(peer_name, command)`.\n"
+        is_main = agent_name.strip() == "Main"
+        default_prompt = (
+            f"You are Terminal Agent ({agent_name}), an assistant that can run PowerShell commands.\n"
+            "Your primary role is to use the terminal to help the user accomplish real tasks (not just give advice).\n"
+            "When you want to execute commands, emit a <Terminal>...</Terminal> block.\n"
+            "\n"
+            "Tools you can use:\n"
+            "- `TerminalExec`: emit a <Terminal>...</Terminal> block (the contents will be executed in the attached interactive PowerShell terminal via ConPTY).\n"
+            "- `web_search`: search the web for up-to-date information.\n"
+            "- `wait(seconds)`: waits up to 5 seconds when you need to pause for a dependency/process instead of repeatedly checking.\n"
+            "\n"
+            "SSH file editing tools (use these when you need to read/edit remote files over SSH, especially if interactive editors like nano/vim are hard to drive):\n"
+            "- `ssh_read_file(host, user, path, sudo=False)`: read a remote text file.\n"
+            "- `ssh_write_file(host, user, path, content, append=False, sudo=False)`: overwrite/append a remote text file.\n"
+            "- `ssh_replace_line(host, user, path, old_line, new_line, occurrences='first', expected_matches=...)`: safe exact-line replace (good for toggling config lines like commenting/uncommenting).\n"
+            "  Note: when `sudo=True`, these use `sudo -n` (non-interactive) and will fail if a password prompt would be required.\n"
+            "- `peer_agent_ask(peer_name, message)`: ask another terminal-tab agent for help.\n"
+            "- `peer_terminal_run(peer_name, command)`: run a command in another terminal tab.\n"
+            "\n"
+            "Anything inside <Terminal>...</Terminal> will be executed in the attached interactive PowerShell terminal (ConPTY).\n"
+            "This behaves like a real terminal: SSH is interactive and stays open, and you can run subsequent commands naturally.\n"
+            "Use `exit` to exit remote shells or close programs. The user can press Stop to reset the terminal.\n"
+            "\n"
+            "If the user asks to connect to the Pi / connect via SSH, prefer:\n"
+            "ssh -X omrijsharon@omrijsharon.local\n"
+            "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
+            "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
+            "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
+            "\n"
+            "Collaboration:\n"
+            "- You can ask other terminal-tab agents for help with `peer_agent_ask(peer_name, message)`.\n"
+            "- You can run a command in another tab with `peer_terminal_run(peer_name, command)`.\n"
+            + (
+                "\nManager role (Main only):\n"
+                "- You are the manager of the other terminal agents (T2, T3, ...).\n"
+                "- Prefer delegating terminal work to them and integrating their results for the user.\n"
+                "- You can create new terminal agents by name using `create_terminal_agent(name)`.\n"
+                if is_main
+                else "\nWorker role:\n"
+                "- You are a worker terminal agent under the Main manager.\n"
+                "- When Main asks you to do something, run the needed commands and report back concisely.\n"
+                "- If you finish early or have nothing to do, say so.\n"
             )
         )
+        override = self._prompt_overrides.get(agent_name.strip())
+        s.set_system_prompt(override if isinstance(override, str) and override.strip() else default_prompt)
         try:
             s.registry.add(tool_spec=_wait_tool_spec(), handler=_wait_tool_handler)
         except Exception:
@@ -1412,9 +1540,14 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         title = QtWidgets.QLabel("Chat")
         title.setObjectName("title")
         header.addWidget(title)
+        self._btn_system = QtWidgets.QPushButton("System")
+        self._btn_system.setObjectName("btn_ghost")
+        self._btn_system.setToolTip("View/edit the system prompt for the active agent tab.")
+        header.addWidget(self._btn_system)
         header.addStretch(1)
-        self._btn_stop = QtWidgets.QPushButton("Stop")
+        self._btn_stop = QtWidgets.QPushButton("Reset")
         self._btn_stop.setObjectName("btn_ghost")
+        self._btn_stop.setToolTip("Hard stop: interrupt and reset the terminal session.")
         header.addWidget(self._btn_stop)
         cl.addLayout(header)
 
@@ -1427,8 +1560,20 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._chat_input.setFixedHeight(92)
         self._btn_send = QtWidgets.QPushButton("Send")
         self._btn_send.setObjectName("btn_primary")
+        self._btn_pause = QtWidgets.QPushButton("Pause")
+        self._btn_pause.setObjectName("btn_ghost")
+        self._btn_pause.setToolTip("Pause/resume streaming (best-effort).")
+        self._btn_pause.setEnabled(False)
+        self._btn_soft_stop = QtWidgets.QPushButton("Stop")
+        self._btn_soft_stop.setObjectName("btn_ghost")
+        self._btn_soft_stop.setToolTip(
+            "Soft stop: stop generating until you send a new message (does not reset the terminal)."
+        )
+        self._btn_soft_stop.setEnabled(False)
         bottom.addWidget(self._chat_input, 1)
         bottom.addWidget(self._btn_send)
+        bottom.addWidget(self._btn_pause)
+        bottom.addWidget(self._btn_soft_stop)
         cl.addLayout(bottom)
 
         self._tokens = QtWidgets.QLabel("")
@@ -1468,6 +1613,9 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         # wiring
         self._btn_send.clicked.connect(self._on_send)
         self._btn_stop.clicked.connect(self._on_stop)
+        self._btn_system.clicked.connect(self._on_edit_system_prompt)
+        self._btn_pause.clicked.connect(self._on_pause_toggle)
+        self._btn_soft_stop.clicked.connect(self._on_soft_stop)
         self._btn_new_tab.clicked.connect(lambda: self._new_tab())
         self._term_tabs.currentChanged.connect(self._on_tab_changed)
         self._term_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
@@ -1514,6 +1662,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             self._cwd_label.setText(str(getattr(st.terminal, "cwd", _repo_root())))
         except Exception:
             self._cwd_label.setText(str(_repo_root()))
+        try:
+            is_busy = bool(st.worker is not None and st.worker.isRunning())
+            self._btn_pause.setEnabled(is_busy)
+            self._btn_soft_stop.setEnabled(is_busy)
+            self._btn_pause.setText("Play" if st.paused else "Pause")
+        except Exception:
+            pass
 
     def _on_tab_close_requested(self, index: int) -> None:
         if self._term_tabs.count() <= 1:
@@ -1544,15 +1699,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
     def _new_tab(self, *, name: str | None = None) -> None:
         tab_id = secrets.token_hex(4)
-        tab_name = (name or f"Term {self._term_tabs.count() + 1}").strip() or f"Term {self._term_tabs.count() + 1}"
-        # Ensure name uniqueness (tools refer to peers by name).
-        existing = {t.name for t in self._tabs.values()}
-        if tab_name in existing:
-            base = tab_name
-            k = 2
-            while f"{base} ({k})" in existing:
-                k += 1
-            tab_name = f"{base} ({k})"
+        tab_name = self._unique_tab_name((name or self._default_tab_name()).strip() or self._default_tab_name())
 
         session = self._make_session(agent_name=tab_name)
         session_lock = threading.Lock()
@@ -1616,6 +1763,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             using_conpty=using_conpty,
             term_signals=term_signals,
             worker=None,
+            paused=False,
             tokens_text="",
             chat_scroll=chat_scroll,
             chat_layout=chat_layout,
@@ -1695,6 +1843,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                         conv = getattr(peer.session, "_conversation", None)
                         if isinstance(conv, list):
                             _sanitize_terminal_blocks_in_conversation(conv, latest_terminal_window=None)
+                            _sanitize_terminal_responses_in_conversation(conv, latest_terminal_response_window=None, max_lines=200)
                     except Exception:
                         pass
 
@@ -1717,10 +1866,10 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                     for b in blocks:
                         peer.terminal.send_and_collect(block=b, idle_ms=450, max_wait_s=25.0)
                         parts.append(f"$ {b}\n(ok)\n")
+                    resp = _truncate_terminal_lines("Terminal results:\n" + "\n---\n".join(parts), max_lines=200)
                     pending = (
-                        "Terminal results:\n"
-                        + "\n---\n".join(parts)
-                        + "\n\nContinue. If more commands are needed, emit more <Terminal> blocks; otherwise reply with a summary."
+                        f"<TerminalResponse>\n{resp}\n</TerminalResponse>\n\n"
+                        "Continue. If more commands are needed, emit more <Terminal> blocks; otherwise reply with a summary."
                     )
 
                 try:
@@ -1739,6 +1888,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+        # Main can create additional worker agents by name.
+        if tab_name == "Main":
+            try:
+                session.registry.add(tool_spec=self._create_terminal_agent_tool_spec(), handler=self._create_terminal_agent_handler)
+            except Exception:
+                pass
+
         # Wire terminal chunks to this tab.
         term_signals.chunk.connect(lambda s, tid=tab_id: self._terminal_append(tid, s))
 
@@ -1753,6 +1909,62 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             self._cwd_label.setText(str(getattr(terminal, "cwd", _repo_root())))
         except Exception:
             self._cwd_label.setText(str(_repo_root()))
+
+    def _default_tab_name(self) -> str:
+        # Main is created explicitly; additional tabs should be T2, T3, ...
+        return f"T{self._term_tabs.count() + 1}"
+
+    def _unique_tab_name(self, desired: str) -> str:
+        tab_name = (desired or "").strip() or self._default_tab_name()
+        existing = {t.name for t in self._tabs.values()}
+        if tab_name not in existing:
+            return tab_name
+        base = tab_name
+        k = 2
+        while f"{base} ({k})" in existing:
+            k += 1
+        return f"{base} ({k})"
+
+    @QtCore.Slot(str)
+    def _new_tab_from_tool(self, name: str) -> None:
+        try:
+            self._new_tab(name=name)
+        except Exception:
+            pass
+
+    def _create_terminal_agent_tool_spec(self) -> JsonDict:
+        return {
+            "type": "function",
+            "name": "create_terminal_agent",
+            "description": "Create a new terminal-tab agent (peer) by name (e.g. T2, BuildBot).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Desired agent name. If taken, a suffix like ' (2)' will be added.",
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        }
+
+    def _create_terminal_agent_handler(self, args: JsonDict) -> str:
+        name = args.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return json.dumps({"ok": False, "error": "name must be a non-empty string"}, ensure_ascii=False)
+        final = self._unique_tab_name(name.strip())
+        try:
+            QtCore.QMetaObject.invokeMethod(
+                self,
+                "_new_tab_from_tool",
+                QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(str, final),
+            )
+        except Exception as e:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+        return json.dumps({"ok": True, "name": final}, ensure_ascii=False)
 
     # ---- chat helpers ----
 
@@ -1795,6 +2007,14 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._chat_input.setEnabled(True)
         self._btn_send.setEnabled(True)
         self._btn_stop.setEnabled(True)
+        self._btn_pause.setEnabled(bool(busy))
+        self._btn_soft_stop.setEnabled(bool(busy))
+        if not busy:
+            st.paused = False
+            try:
+                self._btn_pause.setText("Pause")
+            except Exception:
+                pass
 
         # Manual terminal interaction is still allowed while busy, but we disable the
         # Run button to avoid racing the model's auto-runs.
@@ -1843,12 +2063,108 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
+    def _on_soft_stop(self) -> None:
+        st = self._active_tab()
+        w = st.worker
+        if w is not None and w.isRunning():
+            try:
+                w.request_soft_stop()
+            except Exception:
+                w.request_stop()
+            st.paused = False
+            try:
+                self._btn_pause.setText("Pause")
+            except Exception:
+                pass
+            self._append_chat("[stopped]", kind="tool", tab_id=st.tab_id)
+
+    def _on_pause_toggle(self) -> None:
+        st = self._active_tab()
+        w = st.worker
+        if w is None or not w.isRunning():
+            return
+        st.paused = not bool(st.paused)
+        try:
+            w.set_paused(st.paused)
+        except Exception:
+            pass
+        try:
+            self._btn_pause.setText("Play" if st.paused else "Pause")
+        except Exception:
+            pass
+
+    def _on_edit_system_prompt(self) -> None:
+        st = self._active_tab()
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"System Prompt — {st.name}")
+        dlg.setModal(True)
+        dlg.resize(900, 680)
+
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        help_lbl = QtWidgets.QLabel(
+            "Edit the system prompt for this agent tab. Save applies immediately and persists for future sessions."
+        )
+        help_lbl.setWordWrap(True)
+        help_lbl.setObjectName("subtitle")
+        layout.addWidget(help_lbl)
+
+        editor = QtWidgets.QTextEdit()
+        editor.setAcceptRichText(False)
+        try:
+            editor.setPlainText(st.session.get_system_prompt())
+        except Exception:
+            editor.setPlainText("")
+        layout.addWidget(editor, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_cancel.setObjectName("btn_ghost")
+        btn_save = QtWidgets.QPushButton("Save")
+        btn_save.setObjectName("btn_primary")
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
+
+        def on_cancel() -> None:
+            dlg.reject()
+
+        def on_save() -> None:
+            new_text = editor.toPlainText()
+            try:
+                st.session.set_system_prompt(new_text)
+            except Exception:
+                pass
+            self._prompt_overrides[st.name] = str(new_text)
+            try:
+                _save_terminal_agent_prompt_overrides(base_dir=_repo_root(), overrides=self._prompt_overrides)
+            except Exception:
+                pass
+            try:
+                self._append_chat("[system prompt updated]", kind="tool", tab_id=st.tab_id)
+            except Exception:
+                pass
+            dlg.accept()
+
+        btn_cancel.clicked.connect(on_cancel)
+        btn_save.clicked.connect(on_save)
+
+        dlg.exec()
+
     def _on_send(self) -> None:
         text = self._chat_input.toPlainText().strip()
         if not text:
             return
         self._chat_input.clear()
         st = self._active_tab()
+        st.paused = False
+        try:
+            self._btn_pause.setText("Pause")
+        except Exception:
+            pass
         self._append_chat(text, kind="user", tab_id=st.tab_id)
 
         # One worker at a time.
