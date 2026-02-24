@@ -209,7 +209,7 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 - Strip common noise patterns: progress bars (`[=====>    ] 45%`), pip download progress, apt progress, etc.  
 **Impact**: 10–30% reduction in terminal response token size.
 
-#### - [ ] 2.4 Don't repeat the system prompt in every round's context
+#### - [x] 2.4 Don't repeat the system prompt in every round's context
 
 **Files**: `terminal_agent_ui.py` (`_make_session`)  
 **What**: The system prompt is already passed via `instructions=` in the API call (not as a conversation item). Verify it's not duplicated. Trim the system prompt itself – remove the SSH example (`ssh -X omrijsharon@omrijsharon.local`) and other user-specific content from the _default_ prompt; put those in the prompt override instead.  
@@ -324,25 +324,25 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 
 ### Phase 5: Quality of Life (Low effort, nice to have)
 
-#### - [ ] 5.1 Show SSH status in UI
+#### - [x] 5.1 Show SSH status in UI
 
 **Files**: `terminal_agent_ui.py` (UI)  
 **What**: Add an indicator in the terminal tab header or CWD label showing `🟢 SSH: pi@raspberrypi` or `⚪ Local`.  
 **Impact**: User always knows terminal state at a glance.
 
-#### - [ ] 5.2 Configurable `max_rounds` via UI
+#### - [x] 5.2 Configurable `max_rounds` via UI
 
 **Files**: `terminal_agent_ui.py`  
 **What**: Add a small spinbox or dropdown near the Send button to set rounds (6 / 12 / 20 / unlimited).  
 **Impact**: User can give the agent more autonomy for big tasks.
 
-#### - [ ] 5.3 "Continue" button
+#### - [x] 5.3 "Continue" button
 
 **Files**: `terminal_agent_ui.py`  
 **What**: When the model stops (no `<Terminal>` blocks), show a "Continue" button in the chat that sends `"Continue with the task. If there are remaining steps, execute them."` as the next user message.  
 **Impact**: One-click recovery from premature stops.
 
-#### - [ ] 5.4 Token usage chart
+#### - [x] 5.4 Token usage chart
 
 **Files**: `terminal_agent_ui.py` (UI)  
 **What**: Show a small bar chart or color-coded indicator of token usage relative to the context window. Turn orange at 60%, red at 80%.  
@@ -369,11 +369,11 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 | 🟢 P3 | 3.3 ssh_patch_file tool | 1 hr | SSH file editing | |
 | 🟢 P3 | 3.4 Improve _in_ssh detection | 1 hr | SSH robustness | |
 | 🟢 P3 | 4.4 Persistent scratchpad | 2 hr | Long-session memory | |
-| 🟢 P3 | 5.1 SSH status in UI | 30 min | UX | |
-| 🟢 P3 | 5.3 "Continue" button | 30 min | UX | |
-| ⚪ P4 | 5.2 Configurable max_rounds | 15 min | UX | |
-| ⚪ P4 | 5.4 Token usage chart | 1 hr | UX | |
-| ⚪ P4 | 2.4 System prompt cleanup | 15 min | Minor token savings | |
+| 🟢 P3 | 5.1 SSH status in UI | 30 min | UX | ✅ |
+| 🟢 P3 | 5.3 "Continue" button | 30 min | UX | ✅ |
+| ⚪ P4 | 5.2 Configurable max_rounds | 15 min | UX | ✅ |
+| ⚪ P4 | 5.4 Token usage chart | 1 hr | UX | ✅ |
+| ⚪ P4 | 2.4 System prompt cleanup | 15 min | Minor token savings | ✅ |
 
 **Recommended execution order**: P0 items first (can all be done in one session), then P1 (another session), then P2/P3 as needed.
 

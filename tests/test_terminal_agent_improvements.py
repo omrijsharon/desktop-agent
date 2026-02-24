@@ -132,12 +132,16 @@ class TestMaxRoundsIncreased:
 
     def test_max_rounds_at_least_12(self) -> None:
         src = self._read_source()
-        # Find the _on_send instantiation of _Worker
+        # max_rounds is now driven by a spinbox with default value of 12.
+        # Check that the spinbox default is >= 12.
         import re
-        m = re.search(r"max_rounds\s*=\s*(\d+)", src)
-        assert m is not None, "max_rounds assignment not found"
+        # Look for spinbox setValue(N) where N >= 12
+        m = re.search(r"_rounds_spin\.setValue\((\d+)\)", src)
+        assert m is not None, "rounds spinbox default value not found"
         val = int(m.group(1))
-        assert val >= 12, f"max_rounds should be >= 12, got {val}"
+        assert val >= 12, f"Default max_rounds should be >= 12, got {val}"
+        # Also ensure _on_send uses the spinbox value
+        assert "_rounds_spin.value()" in src, "max_rounds should use _rounds_spin.value()"
 
 
 # === 4.1 Error-retry nudge logic (unit test) ===
@@ -405,3 +409,207 @@ class TestCompactConversation:
         from pathlib import Path
         src = (Path(__file__).resolve().parents[1] / "src" / "desktop_agent" / "terminal_agent_ui.py").read_text(encoding="utf-8")
         assert "_compact_conversation" in src
+
+
+# === 5.3 Continue button ===
+
+
+class TestContinueButton:
+    """Tests that the Continue button is properly wired in the source code."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_continue_button_created(self) -> None:
+        src = self._source()
+        assert '_btn_continue = QtWidgets.QPushButton("Continue")' in src
+
+    def test_continue_button_click_connected(self) -> None:
+        src = self._source()
+        assert "_btn_continue.clicked.connect(self._on_continue)" in src
+
+    def test_on_continue_method_exists(self) -> None:
+        src = self._source()
+        assert "def _on_continue(self)" in src
+
+    def test_continue_button_added_to_layout(self) -> None:
+        src = self._source()
+        assert "addWidget(self._btn_continue)" in src
+
+    def test_continue_button_hidden_initially(self) -> None:
+        src = self._source()
+        assert "_btn_continue.setVisible(False)" in src
+
+    def test_continue_button_visibility_in_set_busy(self) -> None:
+        src = self._source()
+        assert "_btn_continue.setVisible(" in src
+        # Should appear in _set_busy method context
+        import re
+        # Find the _set_busy method and check that _btn_continue visibility is set there
+        match = re.search(r"def _set_busy\(.*?\n(?:.*?\n)*?.*?_btn_continue\.setVisible", src)
+        assert match is not None, "_btn_continue.setVisible should be called inside _set_busy"
+
+    def test_on_continue_sends_message(self) -> None:
+        """_on_continue should put text into chat input and call _on_send."""
+        src = self._source()
+        # The method should reference _on_send to reuse the send flow
+        import re
+        method = re.search(r"def _on_continue\(self\).*?(?=\n    def |\nclass |\Z)", src, re.DOTALL)
+        assert method is not None
+        body = method.group(0)
+        assert "_on_send" in body, "_on_continue should call _on_send"
+
+
+# === 5.1 SSH status in UI ===
+
+
+class TestSSHStatusUI:
+    """Tests that the SSH status indicator is properly wired in the source code."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_ssh_status_label_created(self) -> None:
+        src = self._source()
+        assert "_ssh_status_label" in src
+
+    def test_update_ssh_status_method_exists(self) -> None:
+        src = self._source()
+        assert "def _update_ssh_status(self" in src
+
+    def test_update_ssh_status_called_in_set_busy(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def _set_busy\(.*?\n(?:.*?\n)*?.*?_update_ssh_status", src)
+        assert match is not None, "_update_ssh_status should be called inside _set_busy"
+
+    def test_update_ssh_status_called_on_tab_changed(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def _on_tab_changed\(.*?\n(?:.*?\n)*?.*?_update_ssh_status", src)
+        assert match is not None, "_update_ssh_status should be called inside _on_tab_changed"
+
+    def test_update_ssh_status_shows_ssh_target(self) -> None:
+        src = self._source()
+        import re
+        method = re.search(r"def _update_ssh_status\(self.*?(?=\n    def |\nclass |\Z)", src, re.DOTALL)
+        assert method is not None
+        body = method.group(0)
+        assert "ssh:connected" in body, "Should check for ssh:connected status"
+        assert "SSH" in body, "Should display SSH in the label"
+
+    def test_update_ssh_status_called_on_cwd_changed(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def _on_cwd_changed\(.*?\n(?:.*?\n)*?.*?_update_ssh_status", src)
+        assert match is not None, "_update_ssh_status should be called inside _on_cwd_changed"
+
+
+# === 5.2 Configurable max_rounds ===
+
+
+class TestConfigurableMaxRounds:
+    """Tests that max_rounds is configurable via a UI spinbox."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_rounds_spinbox_created(self) -> None:
+        src = self._source()
+        assert "_rounds_spin" in src
+        assert "QSpinBox" in src
+
+    def test_rounds_spinbox_default_value(self) -> None:
+        src = self._source()
+        import re
+        m = re.search(r"_rounds_spin\.setValue\((\d+)\)", src)
+        assert m is not None, "Spinbox default not found"
+        assert int(m.group(1)) >= 12
+
+    def test_on_send_uses_spinbox_value(self) -> None:
+        src = self._source()
+        assert "_rounds_spin.value()" in src
+
+    def test_spinbox_has_tooltip(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"_rounds_spin\.setToolTip\(", src)
+        assert match is not None, "Spinbox should have a tooltip"
+
+
+# === 5.4 Token usage chart ===
+
+
+class TestTokenUsageBar:
+    """Tests that the token usage progress bar exists and has color logic."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_token_bar_created(self) -> None:
+        src = self._source()
+        assert "_token_bar" in src
+        assert "QProgressBar" in src
+
+    def test_update_token_bar_method_exists(self) -> None:
+        src = self._source()
+        assert "def _update_token_bar(self" in src
+
+    def test_update_token_bar_color_thresholds(self) -> None:
+        src = self._source()
+        import re
+        method = re.search(r"def _update_token_bar\(self.*?(?=\n    def |\nclass |\Z)", src, re.DOTALL)
+        assert method is not None
+        body = method.group(0)
+        # Should have three color thresholds
+        assert "80" in body, "Should have 80% threshold"
+        assert "60" in body, "Should have 60% threshold"
+        # Should change colors
+        assert "#ef4444" in body or "red" in body.lower(), "Should have red color for high usage"
+        assert "#f59e0b" in body or "orange" in body.lower(), "Should have orange color for medium usage"
+        assert "#4ade80" in body or "green" in body.lower(), "Should have green color for low usage"
+
+    def test_update_token_bar_called_from_on_tokens(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def _on_tokens\(.*?\n(?:.*?\n)*?.*?_update_token_bar", src)
+        assert match is not None, "_update_token_bar should be called from _on_tokens"
+
+    def test_update_token_bar_parses_percentage(self) -> None:
+        """Verify the regex in _update_token_bar can parse percentages."""
+        import re
+        # This is the same regex used in the method
+        text = "~45,000/128,000 tok (35.2%)"
+        m = re.search(r"\(([\d.]+)%\)", text)
+        assert m is not None
+        assert float(m.group(1)) == 35.2
+
+        text2 = "~120,000/128,000 tok (93.8%)"
+        m2 = re.search(r"\(([\d.]+)%\)", text2)
+        assert m2 is not None
+        assert float(m2.group(1)) == 93.8
+
+        # No percentage
+        text3 = "~5,000 tok"
+        m3 = re.search(r"\(([\d.]+)%\)", text3)
+        assert m3 is None

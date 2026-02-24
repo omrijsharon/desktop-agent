@@ -1654,53 +1654,27 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         s = ChatSession(api_key=api_key, config=ccfg)
         is_main = agent_name.strip() == "Main"
         default_prompt = (
-            f"You are Terminal Agent ({agent_name}), an assistant that can run PowerShell commands.\n"
-            "Your primary role is to use the terminal to help the user accomplish real tasks (not just give advice).\n"
-            "When you want to execute commands, emit a <Terminal>...</Terminal> block.\n"
+            f"You are Terminal Agent ({agent_name}), an assistant that executes PowerShell commands to accomplish real tasks.\n"
+            "Emit <Terminal>...</Terminal> blocks to run commands in the attached interactive ConPTY terminal.\n"
+            "After commands run, you receive stdout/stderr/exit codes and can continue autonomously.\n"
             "\n"
-            "Tools you can use:\n"
-            "- `TerminalExec`: emit a <Terminal>...</Terminal> block (the contents will be executed in the attached interactive PowerShell terminal via ConPTY).\n"
-            "- `web_search`: search the web for up-to-date information.\n"
-            "- `wait(seconds)`: waits up to 5 seconds when you need to pause for a dependency/process instead of repeatedly checking.\n"
-            "\n"
-            "SSH file editing tools (use these when you need to read/edit remote files over SSH, especially if interactive editors like nano/vim are hard to drive):\n"
-            "- `ssh_read_file(host, user, path, sudo=False)`: read a remote text file.\n"
-            "- `ssh_write_file(host, user, path, content, append=False, sudo=False)`: overwrite/append a remote text file.\n"
-            "- `ssh_replace_line(host, user, path, old_line, new_line, occurrences='first', expected_matches=...)`: safe exact-line replace (good for toggling config lines like commenting/uncommenting).\n"
-            "  Note: when `sudo=True`, these use `sudo -n` (non-interactive) and will fail if a password prompt would be required.\n"
-            "- `peer_agent_ask(peer_name, message)`: ask another terminal-tab agent for help.\n"
-            "- `peer_terminal_run(peer_name, command)`: run a command in another terminal tab.\n"
-            "\n"
-            "Anything inside <Terminal>...</Terminal> will be executed in the attached interactive PowerShell terminal (ConPTY).\n"
-            "This behaves like a real terminal: SSH is interactive and stays open, and you can run subsequent commands naturally.\n"
-            "Use `exit` to exit remote shells or close programs. The user can press Stop to reset the terminal.\n"
-            "\n"
-            "If the user asks to connect to the Pi / connect via SSH, prefer:\n"
-            "ssh -X omrijsharon@omrijsharon.local\n"
-            "Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
-            "For SSH/SCP, prefer options like: -o StrictHostKeyChecking=accept-new\n"
-            "After commands run, you will receive their stdout/stderr/exit codes and can continue.\n"
+            "Terminal behavior:\n"
+            "- SSH sessions are interactive and persist. Use `exit` to leave remote shells.\n"
+            "- For SSH, prefer: ssh -X omrijsharon@omrijsharon.local -o StrictHostKeyChecking=accept-new\n"
+            "- Prefer safe, deterministic commands. Avoid destructive operations unless explicitly requested.\n"
             "\n"
             "Problem-solving protocol:\n"
-            "- When you encounter a problem with multiple possible solutions, think through the options briefly "
-            "(2-3 sentences max per option), pick the most likely to succeed, and execute it.\n"
-            "- If it fails, try the next option. Do NOT ask the user which option to choose unless ALL options "
-            "have been tried and failed.\n"
+            "- Think through options briefly (2-3 sentences max per option), pick the most likely to succeed, execute.\n"
+            "- If it fails, try the next option. Do NOT ask the user which option to choose unless ALL options have failed.\n"
             "- If a command fails, analyze the error, determine the fix, and continue autonomously.\n"
             "\n"
-            "Collaboration:\n"
-            "- You can ask other terminal-tab agents for help with `peer_agent_ask(peer_name, message)`.\n"
-            "- You can run a command in another tab with `peer_terminal_run(peer_name, command)`.\n"
             + (
-                "\nManager role (Main only):\n"
-                "- You are the manager of the other terminal agents (T2, T3, ...).\n"
-                "- Prefer delegating terminal work to them and integrating their results for the user.\n"
-                "- You can create new terminal agents by name using `create_terminal_agent(name)`.\n"
+                "Manager role (Main only):\n"
+                "- Delegate terminal work to other agents (T2, T3, ...) via peer_agent_ask / peer_terminal_run.\n"
+                "- Create new agents with create_terminal_agent(name).\n"
                 if is_main
-                else "\nWorker role:\n"
-                "- You are a worker terminal agent under the Main manager.\n"
-                "- When Main asks you to do something, run the needed commands and report back concisely.\n"
-                "- If you finish early or have nothing to do, say so.\n"
+                else "Worker role:\n"
+                "- Run commands as directed by Main and report back concisely.\n"
             )
         )
         override = self._prompt_overrides.get(agent_name.strip())
@@ -1766,6 +1740,14 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._chat_input.setFixedHeight(92)
         self._btn_send = QtWidgets.QPushButton("Send")
         self._btn_send.setObjectName("btn_primary")
+        # --- 5.2 Configurable max_rounds ---
+        self._rounds_label = QtWidgets.QLabel("Rounds:")
+        self._rounds_label.setObjectName("subtitle")
+        self._rounds_spin = QtWidgets.QSpinBox()
+        self._rounds_spin.setRange(1, 50)
+        self._rounds_spin.setValue(12)
+        self._rounds_spin.setFixedWidth(55)
+        self._rounds_spin.setToolTip("Maximum autonomous rounds per user message.")
         self._btn_pause = QtWidgets.QPushButton("Pause")
         self._btn_pause.setObjectName("btn_ghost")
         self._btn_pause.setToolTip("Pause/resume streaming (best-effort).")
@@ -1776,8 +1758,16 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             "Soft stop: stop generating until you send a new message (does not reset the terminal)."
         )
         self._btn_soft_stop.setEnabled(False)
+        # --- 5.3 Continue button ---
+        self._btn_continue = QtWidgets.QPushButton("Continue")
+        self._btn_continue.setObjectName("btn_ghost")
+        self._btn_continue.setToolTip("Tell the agent to continue working on the task.")
+        self._btn_continue.setVisible(False)
         bottom.addWidget(self._chat_input, 1)
         bottom.addWidget(self._btn_send)
+        bottom.addWidget(self._rounds_label)
+        bottom.addWidget(self._rounds_spin)
+        bottom.addWidget(self._btn_continue)
         bottom.addWidget(self._btn_pause)
         bottom.addWidget(self._btn_soft_stop)
         cl.addLayout(bottom)
@@ -1785,7 +1775,20 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._tokens = QtWidgets.QLabel("")
         self._tokens.setObjectName("subtitle")
         self._tokens.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-        cl.addWidget(self._tokens)
+        # --- 5.4 Token usage bar ---
+        token_row = QtWidgets.QHBoxLayout()
+        self._token_bar = QtWidgets.QProgressBar()
+        self._token_bar.setRange(0, 100)
+        self._token_bar.setValue(0)
+        self._token_bar.setFixedHeight(10)
+        self._token_bar.setTextVisible(False)
+        self._token_bar.setStyleSheet(
+            "QProgressBar { background-color: #333; border-radius: 4px; }"
+            "QProgressBar::chunk { background-color: #4ade80; border-radius: 4px; }"
+        )
+        token_row.addWidget(self._token_bar, 1)
+        token_row.addWidget(self._tokens)
+        cl.addLayout(token_row)
 
         splitter.addWidget(chat_panel)
 
@@ -1804,6 +1807,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._btn_new_tab.setObjectName("btn_ghost")
         thead.addWidget(self._btn_new_tab)
         thead.addStretch(1)
+        # --- 5.1 SSH status indicator ---
+        self._ssh_status_label = QtWidgets.QLabel("")
+        self._ssh_status_label.setObjectName("ssh_status_label")
+        self._ssh_status_label.setStyleSheet(
+            "QLabel { padding: 2px 8px; border-radius: 4px; font-size: 12px; }"
+        )
+        thead.addWidget(self._ssh_status_label)
         self._cwd_label = QtWidgets.QLabel("")
         self._cwd_label.setObjectName("cwd_label")
         thead.addWidget(self._cwd_label)
@@ -1822,6 +1832,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._btn_system.clicked.connect(self._on_edit_system_prompt)
         self._btn_pause.clicked.connect(self._on_pause_toggle)
         self._btn_soft_stop.clicked.connect(self._on_soft_stop)
+        self._btn_continue.clicked.connect(self._on_continue)
         self._btn_new_tab.clicked.connect(lambda: self._new_tab())
         self._term_tabs.currentChanged.connect(self._on_tab_changed)
         self._term_tabs.tabCloseRequested.connect(self._on_tab_close_requested)
@@ -1875,6 +1886,8 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             self._btn_pause.setText("Play" if st.paused else "Pause")
         except Exception:
             pass
+        # --- 5.1 Refresh SSH status on tab switch ---
+        self._update_ssh_status(tid)
 
     def _on_tab_close_requested(self, index: int) -> None:
         if self._term_tabs.count() <= 1:
@@ -2215,6 +2228,10 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._btn_stop.setEnabled(True)
         self._btn_pause.setEnabled(bool(busy))
         self._btn_soft_stop.setEnabled(bool(busy))
+        # --- 5.3 Continue button visibility ---
+        # Show only when idle AND there's been at least one conversation turn
+        has_history = len(getattr(st.session, '_conversation', [])) > 0
+        self._btn_continue.setVisible(not busy and has_history)
         if not busy:
             st.paused = False
             try:
@@ -2226,6 +2243,8 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         # Run button to avoid racing the model's auto-runs.
         st.terminal_run_btn.setEnabled(not busy)
         st.terminal_input.setEnabled(not busy)
+        # --- 5.1 Refresh SSH status indicator ---
+        self._update_ssh_status(tab_id)
 
     # ---- terminal helpers ----
 
@@ -2298,6 +2317,12 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             self._btn_pause.setText("Play" if st.paused else "Pause")
         except Exception:
             pass
+
+    def _on_continue(self) -> None:
+        """Send a 'continue' message to the agent, re-using the _on_send flow."""
+        continuation_text = "Continue working on the task. Do not stop to ask me questions."
+        self._chat_input.setPlainText(continuation_text)
+        self._on_send()
 
     def _on_edit_system_prompt(self) -> None:
         st = self._active_tab()
@@ -2383,7 +2408,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             session=st.session,
             user_text=text,
             terminal=st.terminal,
-            max_rounds=12,
+            max_rounds=self._rounds_spin.value(),
             hide_think=self._hide_think,
             parent=self,
         )
@@ -2430,12 +2455,65 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         st.tokens_text = str(text or "")
         if self._active_tab_id == tab_id:
             self._tokens.setText(st.tokens_text)
+            # --- 5.4 Update token usage bar ---
+            self._update_token_bar(st.tokens_text)
+
+    def _update_token_bar(self, text: str) -> None:
+        """Parse percentage from token text and update the progress bar color."""
+        import re
+        m = re.search(r"\(([\d.]+)%\)", text)
+        if m:
+            pct = min(int(float(m.group(1))), 100)
+        else:
+            pct = 0
+        self._token_bar.setValue(pct)
+        if pct >= 80:
+            color = "#ef4444"  # red
+        elif pct >= 60:
+            color = "#f59e0b"  # orange
+        else:
+            color = "#4ade80"  # green
+        self._token_bar.setStyleSheet(
+            f"QProgressBar {{ background-color: #333; border-radius: 4px; }}"
+            f"QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}"
+        )
 
     def _on_cwd_changed(self, tab_id: str, cwd: str) -> None:
         if tab_id not in self._tabs:
             return
         if self._active_tab_id == tab_id:
             self._cwd_label.setText(str(cwd or ""))
+            self._update_ssh_status(tab_id)
+
+    def _update_ssh_status(self, tab_id: str | None = None) -> None:
+        """Update the SSH status indicator for the given (or active) tab."""
+        tid = tab_id or self._active_tab_id
+        if not tid or tid not in self._tabs:
+            self._ssh_status_label.setText("")
+            return
+        st = self._tabs[tid]
+        if self._active_tab_id != tid:
+            return
+        try:
+            status = str(getattr(st.terminal, "session_status", lambda: "unknown")())
+        except Exception:
+            status = "unknown"
+        if status.startswith("ssh:connected"):
+            # Extract target from "ssh:connected(user@host)" if available
+            import re
+            m = re.search(r"\((.+?)\)", status)
+            target = m.group(1) if m else "remote"
+            self._ssh_status_label.setText(f"🟢 SSH: {target}")
+            self._ssh_status_label.setStyleSheet(
+                "QLabel { padding: 2px 8px; border-radius: 4px; font-size: 12px; "
+                "background-color: #1a3a1a; color: #4ade80; }"
+            )
+        else:
+            self._ssh_status_label.setText("⚪ Local")
+            self._ssh_status_label.setStyleSheet(
+                "QLabel { padding: 2px 8px; border-radius: 4px; font-size: 12px; "
+                "background-color: #2a2a2a; color: #aaa; }"
+            )
 
 
 def main() -> None:
