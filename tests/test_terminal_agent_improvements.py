@@ -1,8 +1,12 @@
-"""Tests for improvement plan tasks 1.3, 1.4, 2.2, 4.1, 4.3.
+"""Tests for improvement plan tasks 1.3, 1.4, 2.2, 2.3, 3.1, 4.1, 4.2, 4.3.
 
 Covers:
 - _head_tail_truncate (2.2 smarter stdout truncation)
+- _strip_terminal_noise (2.3 strip terminal noise)
+- _extract_ssh_target (3.1 SSH context header)
 - Stronger continuation prompt text patterns (1.3)
+- SSH context header (3.1)
+- Self-verification step (4.2)
 - Error-retry nudge detection logic (4.1)
 - Deliberation prompt in system prompt (4.3)
 - max_rounds increased (1.4)
@@ -172,3 +176,133 @@ class TestErrorRetryNudgeLogic:
 
     def test_none_exit_no_error(self) -> None:
         assert self._should_nudge(None, "ok", "") is False
+
+
+# === 2.3 _strip_terminal_noise ===
+
+
+class TestStripTerminalNoise:
+    @staticmethod
+    def _func(text: str) -> str:
+        from desktop_agent.terminal_agent_ui import _strip_terminal_noise
+        return _strip_terminal_noise(text)
+
+    def test_empty(self) -> None:
+        assert self._func("") == ""
+
+    def test_strips_progress_bars(self) -> None:
+        text = "Starting build\n[========>     ] 60%\nDone"
+        result = self._func(text)
+        assert "========" not in result
+        assert "Starting build" in result
+        assert "Done" in result
+
+    def test_strips_ansi_escapes(self) -> None:
+        text = "hello \x1b[32mgreen\x1b[0m world"
+        result = self._func(text)
+        assert "\x1b" not in result
+        assert "hello" in result
+        assert "green" in result
+        assert "world" in result
+
+    def test_strips_powershell_prompt(self) -> None:
+        text = "PS C:\\Users\\user> Get-ChildItem\nfile1.txt\nfile2.txt"
+        result = self._func(text)
+        assert "PS C:\\" not in result
+        assert "file1.txt" in result
+
+    def test_strips_pip_progress(self) -> None:
+        text = "Downloading requests-2.28.0.tar.gz\nOK"
+        result = self._func(text)
+        assert "Downloading" not in result
+        assert "OK" in result
+
+    def test_collapses_blank_lines(self) -> None:
+        text = "line1\n\n\n\n\nline2"
+        result = self._func(text)
+        assert "\n\n\n" not in result
+        assert "line1" in result
+        assert "line2" in result
+
+    def test_preserves_normal_text(self) -> None:
+        text = "total 48\ndrwxr-xr-x 2 user user 4096 Feb 25 10:00 .\n-rw-r--r-- 1 user user  123 Feb 25 10:00 file.py"
+        result = self._func(text)
+        assert "total 48" in result
+        assert "file.py" in result
+
+
+# === 3.1 _extract_ssh_target ===
+
+
+class TestExtractSshTarget:
+    @staticmethod
+    def _func(cmd: str) -> str:
+        from desktop_agent.terminal_agent_ui import _extract_ssh_target
+        return _extract_ssh_target(cmd)
+
+    def test_simple(self) -> None:
+        assert self._func("ssh user@host") == "user@host"
+
+    def test_with_flags(self) -> None:
+        assert self._func("ssh -X user@host.local") == "user@host.local"
+
+    def test_just_host(self) -> None:
+        assert self._func("ssh myserver") == "myserver"
+
+    def test_multiple_flags(self) -> None:
+        assert self._func("ssh -o StrictHostKeyChecking=no user@pi.local") == "user@pi.local"
+
+    def test_empty(self) -> None:
+        assert self._func("") == ""
+
+    def test_ssh_only(self) -> None:
+        # Edge case: just "ssh" with no target
+        assert self._func("ssh") == ""
+
+    def test_with_port_flag(self) -> None:
+        # -p takes a value argument; parser should skip both -p and 2222
+        result = self._func("ssh -p 2222 user@host")
+        assert result == "user@host"
+
+
+# === 3.1 SSH context header in source ===
+
+
+class TestSshContextHeader:
+    @staticmethod
+    def _read_source() -> str:
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[1] / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        return p.read_text(encoding="utf-8")
+
+    def test_ssh_context_block_present(self) -> None:
+        src = self._read_source()
+        assert "[SSH Context]" in src
+        assert "[/SSH Context]" in src
+
+    def test_session_status_includes_target(self) -> None:
+        src = self._read_source()
+        assert "ssh:connected(" in src, "session_status should include target in parens"
+
+
+# === 4.2 Self-verification step ===
+
+
+class TestSelfVerificationStep:
+    @staticmethod
+    def _read_source() -> str:
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[1] / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        return p.read_text(encoding="utf-8")
+
+    def test_verification_prompt_present(self) -> None:
+        src = self._read_source()
+        assert "Before finishing, verify your work" in src
+
+    def test_verified_flag_reset(self) -> None:
+        src = self._read_source()
+        assert "_verified = False" in src, "Verification flag should be reset each run"
+
+    def test_verified_flag_set(self) -> None:
+        src = self._read_source()
+        assert "_verified = True" in src, "Verification flag should be set after first use"

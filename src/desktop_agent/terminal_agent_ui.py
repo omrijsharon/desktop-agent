@@ -163,6 +163,62 @@ def _head_tail_truncate(text: str, *, max_chars: int = 4000,
     return text
 
 
+# --- 2.3 strip terminal noise ---
+_NOISE_PATTERNS: list[re.Pattern[str]] = [
+    # Progress bars:  [=====>     ] 45%   or   ━━━━━╺━━━ 50%
+    re.compile(r"^.*[\[━=>#\-]{5,}.*\d+%.*$", re.MULTILINE),
+    # pip / npm download progress lines
+    re.compile(r"^\s*(Downloading|Collecting|Installing|Using cached)\b.*$", re.MULTILINE),
+    # apt progress
+    re.compile(r"^\s*(Get:\d+|Hit:\d+|Ign:\d+)\s.*$", re.MULTILINE),
+    # Blank lines (collapse multiple into one)
+    re.compile(r"\n{3,}"),
+    # PowerShell prompt echo (PS C:\...>)
+    re.compile(r"^PS [A-Za-z]:\\[^>]*>.*$", re.MULTILINE),
+    # ANSI escape leftovers
+    re.compile(r"\x1b\[[0-9;]*[A-Za-z]"),
+]
+
+
+def _strip_terminal_noise(text: str) -> str:
+    """Remove common terminal noise patterns to reduce token waste."""
+    if not text:
+        return text
+    for pat in _NOISE_PATTERNS:
+        text = pat.sub("", text)
+    # Collapse runs of blank lines into a single blank line
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _extract_ssh_target(cmd: str) -> str:
+    """Extract user@host (or just host) from an ssh command string.
+
+    Examples:
+        ssh user@host          -> user@host
+        ssh -X user@host.local -> user@host.local
+        ssh -o StrictHostKeyChecking=no user@pi.local -> user@pi.local
+        ssh host               -> host
+    """
+    parts = (cmd or "").strip().split()
+    # Flags that take a following argument (ssh man page)
+    _VALUE_FLAGS = {"-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J",
+                    "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S",
+                    "-W", "-w"}
+    skip_next = False
+    for p in parts[1:]:  # skip 'ssh' itself
+        if skip_next:
+            skip_next = False
+            continue
+        if p.startswith("-"):
+            if p in _VALUE_FLAGS:
+                skip_next = True  # next token is the option value
+            continue
+        # first non-flag, non-value token is the target
+        return p
+    return ""
+
+
 def _sanitize_terminal_blocks_in_conversation(
     conversation_items: list[JsonDict], *, latest_terminal_window: str | None
 ) -> list[JsonDict]:
@@ -996,6 +1052,7 @@ class _ConptyTerminal:
         self._buf_lock = QtCore.QMutex()
         self._reader_thread: Optional[threading.Thread] = None
         self._in_ssh: bool = False
+        self._ssh_target: str = ""  # 3.1: store user@host when SSH detected
         self.start()
 
     def _emit(self, s: str) -> None:
@@ -1199,6 +1256,7 @@ class _ConptyTerminal:
         # Starting interactive SSH: switch modes and use idle capture (no prompt sentinel).
         elif self._looks_like_interactive_ssh(cmd):
             self._in_ssh = True
+            self._ssh_target = _extract_ssh_target(cmd)  # 3.1
             self.send(cmd)
             captured = self._wait_idle(start_idx=start_idx, idle_ms=idle_ms, max_wait_s=max_wait_s)
         else:
@@ -1214,6 +1272,7 @@ class _ConptyTerminal:
         # earlier in the transcript (e.g., before the ssh command starts).
         if _powershell_prompt_at_end(captured):
             self._in_ssh = False
+            self._ssh_target = ""  # 3.1: clear target on exit
 
         elapsed = time.monotonic() - start
         return CommandResult(command=cmd, exit_code=0, stdout=captured, stderr="", elapsed_s=float(elapsed), cwd_after=str(self.cwd))
@@ -1221,7 +1280,8 @@ class _ConptyTerminal:
     def session_status(self) -> str:
         # Expose SSH state so the model knows if it's local or remote.
         if self._in_ssh:
-            return "ssh:connected"
+            tgt = self._ssh_target
+            return f"ssh:connected({tgt})" if tgt else "ssh:connected"
         return "local(powershell)"
 
 
@@ -1273,6 +1333,7 @@ class _Worker(QtCore.QThread):
 
     def run(self) -> None:  # type: ignore[override]
         self.signals.busy.emit(True)
+        self._verified = False  # 4.2: reset verification flag each run
         try:
             pending_user = self.user_text
             for _r in range(max(1, self.max_rounds)):
@@ -1335,6 +1396,20 @@ class _Worker(QtCore.QThread):
 
                 blocks = extract_terminal_blocks(full_raw)
                 if not blocks:
+                    # --- 4.2 self-verification step ---
+                    # On the first "no blocks" stop, inject a verification nudge
+                    # and give the model one more chance.  Use a flag so we only
+                    # do this once (avoid infinite loop).
+                    if not getattr(self, "_verified", False) and _r > 0:
+                        self._verified = True
+                        pending_user = (
+                            "Before finishing, verify your work:\n"
+                            "1. Did all commands succeed without errors?\n"
+                            "2. Is the desired outcome achieved? If anything is missing, continue.\n"
+                            "3. If you need to verify, emit a <Terminal> block with a test command.\n"
+                            "Only summarize if everything is confirmed working.\n"
+                        )
+                        continue
                     return
 
                 self.signals.tool_msg.emit(f"[terminal] executing {len(blocks)} block(s)…")
@@ -1356,6 +1431,9 @@ class _Worker(QtCore.QThread):
                 for res in results:
                     so = (res.stdout or "").strip()
                     se = (res.stderr or "").strip()
+                    # --- 2.3 strip terminal noise ---
+                    so = _strip_terminal_noise(so)
+                    se = _strip_terminal_noise(se)
                     # --- 2.2 smarter stdout truncation: head + tail ---
                     so = _head_tail_truncate(so, max_chars=4000, head_lines=40, tail_lines=80)
                     se = _head_tail_truncate(se, max_chars=2000, head_lines=20, tail_lines=40)
@@ -1383,10 +1461,21 @@ class _Worker(QtCore.QThread):
                 except Exception:
                     term_state = "interactive"
 
-                # --- 1.2 explicit SSH context line ---
+                # --- 1.2 + 3.1 explicit SSH context header ---
                 ssh_context = ""
                 if "ssh" in term_state.lower():
-                    ssh_context = "You are currently inside an SSH session on the remote host.\n"
+                    # Extract target from status string like "ssh:connected(user@host)"
+                    _tgt = ""
+                    if "(" in term_state and ")" in term_state:
+                        _tgt = term_state.split("(", 1)[1].rstrip(")")
+                    ssh_context = (
+                        "[SSH Context]\n"
+                        + (f"Target: {_tgt}\n" if _tgt else "")
+                        + "Status: connected\n"
+                        + "You are currently inside an SSH session on the remote host.\n"
+                        + "Use `exit` to return to local PowerShell.\n"
+                        + "[/SSH Context]\n"
+                    )
                 else:
                     ssh_context = "You are on the local Windows machine.\n"
 

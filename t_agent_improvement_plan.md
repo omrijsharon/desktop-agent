@@ -200,7 +200,7 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 - For commands that produce very large output, add a hint: `"(output truncated; {total_lines} total lines, showing first 40 + last 80)"`.  
 **Impact**: Model gets more useful signal per token spent.
 
-#### - [ ] 2.3 Strip terminal noise from history
+#### - [x] 2.3 Strip terminal noise from history ✅ 2026-02-25T12:00Z
 
 **Files**: `terminal_agent_ui.py`  
 **What**:
@@ -217,7 +217,7 @@ IMPORTANT: You have {rounds_remaining} rounds remaining.
 
 ### Phase 3: SSH Robustness (Medium effort, high impact)
 
-#### - [ ] 3.1 Persistent SSH context header
+#### - [x] 3.1 Persistent SSH context header ✅ 2026-02-25T12:00Z
 
 **Files**: `terminal_agent_ui.py`  
 **What**: When the terminal is in SSH mode, prepend a structured context block to every `pending_user`:
@@ -278,7 +278,7 @@ Analyze the error, determine the fix, and continue. Do NOT stop to ask the user.
 ```
 **Impact**: Model retries failures instead of stopping and asking the user.
 
-#### - [ ] 4.2 Self-verification step
+#### - [x] 4.2 Self-verification step ✅ 2026-02-25T12:00Z
 
 **Files**: `terminal_agent_ui.py` (`_Worker.run`)  
 **What**: Before declaring a task done (no `<Terminal>` blocks in output), inject a verification prompt:
@@ -362,10 +362,10 @@ The model can update the scratchpad via a tool call (`scratchpad_set(key, value)
 | 🟠 P1 | 2.2 Smarter stdout truncation | 30 min | Token efficiency | ✅ |
 | 🟠 P1 | 4.1 Error-retry nudge | 30 min | Auto-recovery from failures | ✅ |
 | 🟡 P2 | 2.1 Conversation compaction | 2 hr | Major token savings | |
-| 🟡 P2 | 3.1 SSH context header | 1 hr | SSH robustness | |
-| 🟡 P2 | 2.3 Strip terminal noise | 1 hr | Token efficiency | |
+| 🟡 P2 | 3.1 SSH context header | 1 hr | SSH robustness | ✅ |
+| 🟡 P2 | 2.3 Strip terminal noise | 1 hr | Token efficiency | ✅ |
 | 🟡 P2 | 3.2 ssh_run_command tool | 1 hr | Reliable remote commands | |
-| 🟡 P2 | 4.2 Self-verification step | 30 min | Task completion quality | |
+| 🟡 P2 | 4.2 Self-verification step | 30 min | Task completion quality | ✅ |
 | 🟢 P3 | 3.3 ssh_patch_file tool | 1 hr | SSH file editing | |
 | 🟢 P3 | 3.4 Improve _in_ssh detection | 1 hr | SSH robustness | |
 | 🟢 P3 | 4.4 Persistent scratchpad | 2 hr | Long-session memory | |
