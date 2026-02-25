@@ -182,3 +182,62 @@ class TestSourceCodePatterns:
         assert 'return "interactive(conpty)"' not in source, (
             "session_status() still returns hardcoded 'interactive(conpty)'"
         )
+
+
+# === 3.4 Improved SSH detection ===
+
+
+class TestImprovedSSHDetection:
+    """Tests for SSH disconnect detection and longer SSH wait."""
+
+    @staticmethod
+    def _read_source() -> str:
+        from pathlib import Path
+        p = Path(__file__).resolve().parents[1] / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        return p.read_text(encoding="utf-8")
+
+    def test_ssh_disconnect_patterns_in_update_method(self) -> None:
+        """_maybe_update_ssh_state_from_text should detect SSH exit patterns."""
+        src = self._read_source()
+        assert "connection to " in src.lower()
+        assert "connection closed by" in src.lower()
+        assert "logout" in src.lower()
+
+    def test_ssh_disconnect_clears_target(self) -> None:
+        """When SSH disconnects, _ssh_target should be cleared."""
+        src = self._read_source()
+        import re
+        # In _maybe_update_ssh_state_from_text, disconnect should clear target
+        method = re.search(
+            r"def _maybe_update_ssh_state_from_text\(self.*?(?=\n    def |\nclass |\Z)",
+            src, re.DOTALL
+        )
+        assert method is not None
+        body = method.group(0)
+        assert '_ssh_target = ""' in body, "Disconnect should clear _ssh_target"
+
+    def test_ssh_connection_uses_longer_wait(self) -> None:
+        """Interactive SSH should use longer idle wait than default."""
+        src = self._read_source()
+        import re
+        # Look for SSH-specific idle/max wait in send_and_collect
+        assert "ssh_idle" in src, "Should have SSH-specific idle time"
+        assert "ssh_max" in src, "Should have SSH-specific max wait"
+        # The SSH idle should be at least 2000ms
+        m = re.search(r"ssh_idle\s*=\s*max\(idle_ms,\s*(\d+)\)", src)
+        assert m is not None
+        assert int(m.group(1)) >= 2000, "SSH idle should be >= 2000ms"
+
+    def test_send_and_collect_detects_disconnect(self) -> None:
+        """send_and_collect should also detect SSH disconnect in captured output."""
+        src = self._read_source()
+        import re
+        # Find the ConptyTerminal's send_and_collect (the second one)
+        methods = list(re.finditer(
+            r"def send_and_collect\(self.*?(?=\n    def |\nclass |\Z)",
+            src, re.DOTALL
+        ))
+        assert len(methods) >= 2
+        body = methods[-1].group(0)
+        assert "3.4" in body or "disconnect" in body.lower() or "connection to" in body.lower(), \
+            "send_and_collect should detect SSH disconnect in captured output"

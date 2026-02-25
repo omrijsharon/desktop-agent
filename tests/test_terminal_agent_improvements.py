@@ -563,7 +563,8 @@ class TestTokenUsageBar:
         from pathlib import Path
         return (
             Path(__file__).resolve().parents[1]
-            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+            / "src" / "desktop_agent"
+            / "terminal_agent_ui.py"
         ).read_text(encoding="utf-8")
 
     def test_token_bar_created(self) -> None:
@@ -613,3 +614,151 @@ class TestTokenUsageBar:
         text3 = "~5,000 tok"
         m3 = re.search(r"\(([\d.]+)%\)", text3)
         assert m3 is None
+
+
+# === 3.2 ssh_run_command tool ===
+
+
+class TestSSHRunCommandTool:
+    """Tests for the ssh_run_command tool spec and handler."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_tool_spec_exists(self) -> None:
+        from desktop_agent.terminal_agent_ui import _ssh_run_command_tool_spec
+        spec = _ssh_run_command_tool_spec()
+        assert spec["name"] == "ssh_run_command"
+        assert "host" in spec["parameters"]["properties"]
+        assert "user" in spec["parameters"]["properties"]
+        assert "command" in spec["parameters"]["properties"]
+        assert "sudo" in spec["parameters"]["properties"]
+        assert "timeout_s" in spec["parameters"]["properties"]
+
+    def test_handler_validates_inputs(self) -> None:
+        from desktop_agent.terminal_agent_ui import _ssh_run_command_handler
+        import json
+        # Missing host
+        r = json.loads(_ssh_run_command_handler({"user": "u", "command": "ls"}))
+        assert r["ok"] is False
+        assert "host" in r["error"]
+        # Missing user
+        r = json.loads(_ssh_run_command_handler({"host": "h", "command": "ls"}))
+        assert r["ok"] is False
+        assert "user" in r["error"]
+        # Missing command
+        r = json.loads(_ssh_run_command_handler({"host": "h", "user": "u"}))
+        assert r["ok"] is False
+        assert "command" in r["error"]
+        # Empty command
+        r = json.loads(_ssh_run_command_handler({"host": "h", "user": "u", "command": ""}))
+        assert r["ok"] is False
+
+    def test_tool_registered(self) -> None:
+        src = self._source()
+        assert "_ssh_run_command_tool_spec()" in src
+        assert "_ssh_run_command_handler" in src
+        assert "ssh_run_command" in src
+
+
+# === 3.3 ssh_patch_file tool ===
+
+
+class TestSSHPatchFileTool:
+    """Tests for the ssh_patch_file tool spec and handler."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_tool_spec_exists(self) -> None:
+        from desktop_agent.terminal_agent_ui import _ssh_patch_file_tool_spec
+        spec = _ssh_patch_file_tool_spec()
+        assert spec["name"] == "ssh_patch_file"
+        assert "host" in spec["parameters"]["properties"]
+        assert "user" in spec["parameters"]["properties"]
+        assert "path" in spec["parameters"]["properties"]
+        assert "pattern" in spec["parameters"]["properties"]
+        assert "replacement" in spec["parameters"]["properties"]
+
+    def test_handler_validates_inputs(self) -> None:
+        from desktop_agent.terminal_agent_ui import _ssh_patch_file_handler
+        import json
+        # Missing pattern
+        r = json.loads(_ssh_patch_file_handler({"host": "h", "user": "u", "path": "/a", "replacement": "x"}))
+        assert r["ok"] is False
+        assert "pattern" in r["error"]
+        # Missing replacement
+        r = json.loads(_ssh_patch_file_handler({"host": "h", "user": "u", "path": "/a", "pattern": "x"}))
+        assert r["ok"] is False
+        assert "replacement" in r["error"]
+
+    def test_tool_registered(self) -> None:
+        src = self._source()
+        assert "_ssh_patch_file_tool_spec()" in src
+        assert "_ssh_patch_file_handler" in src
+        assert "ssh_patch_file" in src
+
+
+# === 4.4 Persistent session scratchpad ===
+
+
+class TestPersistentScratchpad:
+    """Tests for the persistent scratchpad feature."""
+
+    @staticmethod
+    def _source() -> str:
+        from pathlib import Path
+        return (
+            Path(__file__).resolve().parents[1]
+            / "src" / "desktop_agent" / "terminal_agent_ui.py"
+        ).read_text(encoding="utf-8")
+
+    def test_scratchpad_field_on_tab_state(self) -> None:
+        src = self._source()
+        assert "scratchpad" in src
+        # Should be in _TabState dataclass
+        import re
+        match = re.search(r"class _TabState.*?(?=\nclass )", src, re.DOTALL)
+        assert match is not None
+        body = match.group(0)
+        assert "scratchpad" in body
+
+    def test_scratchpad_tools_registered(self) -> None:
+        src = self._source()
+        assert "scratchpad_set" in src
+        assert "scratchpad_clear" in src
+
+    def test_scratchpad_injected_in_worker(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def run\(self\).*?(?=\n    def |\nclass |\Z)", src, re.DOTALL)
+        assert match is not None
+        body = match.group(0)
+        assert "[Scratchpad]" in body, "Worker should inject scratchpad block"
+        assert "[/Scratchpad]" in body
+
+    def test_worker_accepts_scratchpad_param(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"class _Worker.*?def __init__\(.*?\).*?:", src, re.DOTALL)
+        assert match is not None
+        body = match.group(0)
+        assert "scratchpad" in body
+
+    def test_on_send_passes_scratchpad(self) -> None:
+        src = self._source()
+        import re
+        match = re.search(r"def _on_send\(self\).*?(?=\n    def |\nclass |\Z)", src, re.DOTALL)
+        assert match is not None
+        body = match.group(0)
+        assert "scratchpad" in body, "_on_send should pass scratchpad to Worker"

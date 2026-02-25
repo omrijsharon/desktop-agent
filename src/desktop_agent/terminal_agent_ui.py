@@ -717,6 +717,223 @@ def _ssh_replace_line_handler(args: JsonDict) -> str:
     return json.dumps(j, ensure_ascii=False)
 
 
+# --- 3.2 ssh_run_command tool ---
+
+def _ssh_run_command_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "ssh_run_command",
+        "description": (
+            "Run a single command on a remote host via a fresh SSH connection. "
+            "Returns stdout, stderr, and exit code. More reliable than interactive terminal for "
+            "non-interactive commands. Uses BatchMode (key auth only, no password prompt)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Remote host (e.g. omrijsharon.local)."},
+                "user": {"type": "string", "description": "SSH username (e.g. omrijsharon)."},
+                "command": {"type": "string", "description": "Shell command to run on the remote host."},
+                "sudo": {
+                    "type": "boolean",
+                    "description": "Wrap command with sudo -n (non-interactive). Fails if password required.",
+                    "default": False,
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": "SSH command timeout in seconds.",
+                    "default": 30.0,
+                    "minimum": 1.0,
+                    "maximum": 300.0,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Max characters of stdout to return (truncates).",
+                    "default": 40000,
+                    "minimum": 1,
+                    "maximum": 200000,
+                },
+            },
+            "required": ["host", "user", "command"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _ssh_run_command_handler(args: JsonDict) -> str:
+    host = args.get("host")
+    user = args.get("user")
+    command = args.get("command")
+    sudo = bool(args.get("sudo", False))
+    timeout_s = float(args.get("timeout_s", 30.0))
+    max_chars = int(args.get("max_chars", 40000))
+
+    if not isinstance(host, str) or not host.strip():
+        return json.dumps({"ok": False, "error": "host must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(user, str) or not user.strip():
+        return json.dumps({"ok": False, "error": "user must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(command, str) or not command.strip():
+        return json.dumps({"ok": False, "error": "command must be a non-empty string"}, ensure_ascii=False)
+    timeout_s = max(1.0, min(300.0, timeout_s))
+    max_chars = max(1, min(200000, max_chars))
+
+    remote_cmd = f"{'sudo -n ' if sudo else ''}{command}"
+    cmd = _ssh_base_args(user=user.strip(), host=host.strip()) + [remote_cmd]
+    try:
+        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": "ssh not found on PATH"}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "error": f"ssh_run_command timed out after {timeout_s}s"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+    stdout = cp.stdout or ""
+    stderr = cp.stderr or ""
+    truncated = False
+    if len(stdout) > max_chars:
+        stdout = stdout[:max_chars]
+        truncated = True
+    if len(stderr) > 4000:
+        stderr = stderr[:4000]
+
+    return json.dumps({
+        "ok": cp.returncode == 0,
+        "exit_code": cp.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": truncated,
+    }, ensure_ascii=False)
+
+
+# --- 3.3 ssh_patch_file tool (regex-based) ---
+
+def _ssh_patch_file_tool_spec() -> JsonDict:
+    return {
+        "type": "function",
+        "name": "ssh_patch_file",
+        "description": (
+            "Regex-based find-and-replace in a remote file over SSH. "
+            "More robust than ssh_replace_line for edits where whitespace varies. "
+            "Uses Python's re.sub on the remote host."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "description": "Remote host (e.g. omrijsharon.local)."},
+                "user": {"type": "string", "description": "SSH username (e.g. omrijsharon)."},
+                "path": {"type": "string", "description": "Remote file path to edit (POSIX path)."},
+                "pattern": {
+                    "type": "string",
+                    "description": "Python regex pattern to search for (re.MULTILINE enabled).",
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": "Replacement string (supports \\1, \\2, etc. backreferences).",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Max number of replacements (0 = all). Default: 0.",
+                    "default": 0,
+                    "minimum": 0,
+                },
+                "sudo": {
+                    "type": "boolean",
+                    "description": "Use sudo (non-interactive: sudo -n).",
+                    "default": False,
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": "SSH command timeout seconds.",
+                    "default": 30.0,
+                    "minimum": 1.0,
+                    "maximum": 120.0,
+                },
+            },
+            "required": ["host", "user", "path", "pattern", "replacement"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _ssh_patch_file_handler(args: JsonDict) -> str:
+    host = args.get("host")
+    user = args.get("user")
+    path = args.get("path")
+    pattern = args.get("pattern")
+    replacement = args.get("replacement")
+    count = int(args.get("count", 0))
+    sudo = bool(args.get("sudo", False))
+    timeout_s = float(args.get("timeout_s", 30.0))
+
+    if not isinstance(host, str) or not host.strip():
+        return json.dumps({"ok": False, "error": "host must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(user, str) or not user.strip():
+        return json.dumps({"ok": False, "error": "user must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(path, str) or not path.strip():
+        return json.dumps({"ok": False, "error": "path must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(pattern, str) or not pattern:
+        return json.dumps({"ok": False, "error": "pattern must be a non-empty string"}, ensure_ascii=False)
+    if not isinstance(replacement, str):
+        return json.dumps({"ok": False, "error": "replacement must be a string"}, ensure_ascii=False)
+    timeout_s = max(1.0, min(120.0, timeout_s))
+    count = max(0, count)
+
+    payload = {
+        "path": str(path),
+        "pattern": pattern,
+        "replacement": replacement,
+        "count": count,
+    }
+    code = (
+        "import sys, json, re, base64\n"
+        "p = json.loads(base64.b64decode(sys.stdin.buffer.read()).decode('utf-8'))\n"
+        "path = p['path']\n"
+        "pat = p['pattern']\n"
+        "repl = p['replacement']\n"
+        "cnt = p.get('count', 0)\n"
+        "with open(path, 'r', encoding='utf-8', newline='') as f:\n"
+        "    data = f.read()\n"
+        "new_data, n = re.subn(pat, repl, data, count=cnt, flags=re.MULTILINE)\n"
+        "if n == 0:\n"
+        "    print(json.dumps({'ok': False, 'error': 'no_match', 'matches': 0}))\n"
+        "    raise SystemExit(3)\n"
+        "with open(path, 'w', encoding='utf-8', newline='') as f:\n"
+        "    f.write(new_data)\n"
+        "print(json.dumps({'ok': True, 'matches': n}))\n"
+    )
+    remote_cmd = f"{'sudo -n ' if sudo else ''}python3 -c {shlex.quote(code)}"
+    cmd = _ssh_base_args(user=user.strip(), host=host.strip()) + [remote_cmd]
+    b64 = __import__("base64").b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    try:
+        cp = subprocess.run(cmd, input=b64, capture_output=True, text=False, timeout=timeout_s, check=False)  # noqa: S603
+    except FileNotFoundError:
+        return json.dumps({"ok": False, "error": "ssh not found on PATH"}, ensure_ascii=False)
+    except subprocess.TimeoutExpired:
+        return json.dumps({"ok": False, "error": f"ssh_patch_file timed out after {timeout_s}s"}, ensure_ascii=False)
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
+
+    stdout = (cp.stdout or b"").decode("utf-8", errors="replace").strip()
+    stderr = (cp.stderr or b"").decode("utf-8", errors="replace").strip()
+    if cp.returncode != 0:
+        try:
+            j = json.loads(stdout) if stdout.startswith("{") else None
+        except Exception:
+            j = None
+        if isinstance(j, dict) and j.get("ok") is False:
+            j["returncode"] = cp.returncode
+            if stderr:
+                j["stderr"] = stderr
+            return json.dumps(j, ensure_ascii=False)
+        return json.dumps({"ok": False, "returncode": cp.returncode, "stdout": stdout, "stderr": stderr}, ensure_ascii=False)
+    try:
+        j = json.loads(stdout) if stdout.startswith("{") else {"ok": True, "stdout": stdout}
+    except Exception:
+        j = {"ok": True, "stdout": stdout}
+    return json.dumps(j, ensure_ascii=False)
+
+
 def _peer_agent_ask_tool_spec() -> JsonDict:
     return {
         "type": "function",
@@ -1121,6 +1338,7 @@ class _ConptyTerminal:
         - SSH login banners / "Last login:" suggests we entered a remote session.
         - A Linux-style prompt "user@host:~ $" suggests we're in a remote shell.
         - Seeing our PowerShell sentinel prompt at the end suggests we're back.
+        - SSH disconnect patterns (logout, Connection closed) means we left SSH.
         """
 
         if not text:
@@ -1129,6 +1347,21 @@ class _ConptyTerminal:
         if not t:
             return
         t_cf = t.casefold()
+
+        # --- 3.4 Detect SSH disconnect ---
+        _SSH_EXIT_PATTERNS = (
+            "connection to ",  # "Connection to ... closed."
+            "connection closed by",
+            "logout",
+            "connection reset by peer",
+            "broken pipe",
+        )
+        for pat in _SSH_EXIT_PATTERNS:
+            if pat in t_cf and ("closed" in t_cf or "logout" in t_cf or "pipe" in t_cf or "reset" in t_cf):
+                self._in_ssh = False
+                self._ssh_target = ""
+                return
+
         is_banner = t_cf.startswith("last login:") or t_cf.startswith("linux ") or t_cf.startswith("debian gnu/linux")
         if is_banner or _LINUX_PROMPT_RE.search(t):
             self._in_ssh = True
@@ -1136,6 +1369,7 @@ class _ConptyTerminal:
         # If we see our PowerShell prompt sentinel at the end, we are not in ssh.
         if _powershell_prompt_at_end(t):
             self._in_ssh = False
+            self._ssh_target = ""
 
     def start(self) -> None:
         self._stop_flag = False
@@ -1298,11 +1532,15 @@ class _ConptyTerminal:
             self.send(cmd)
             captured = self._wait_idle(start_idx=start_idx, idle_ms=idle_ms, max_wait_s=max_wait_s)
         # Starting interactive SSH: switch modes and use idle capture (no prompt sentinel).
+        # --- 3.4 Use longer idle wait for SSH connection to establish ---
         elif self._looks_like_interactive_ssh(cmd):
             self._in_ssh = True
             self._ssh_target = _extract_ssh_target(cmd)  # 3.1
             self.send(cmd)
-            captured = self._wait_idle(start_idx=start_idx, idle_ms=idle_ms, max_wait_s=max_wait_s)
+            # SSH handshake + banner can take several seconds; use 2s idle, 15s max
+            ssh_idle = max(idle_ms, 2000)
+            ssh_max = max(max_wait_s, 15.0)
+            captured = self._wait_idle(start_idx=start_idx, idle_ms=ssh_idle, max_wait_s=ssh_max)
         else:
             done = f"__TA_DONE__{secrets.token_hex(4)}"
             self.send(cmd)
@@ -1317,6 +1555,14 @@ class _ConptyTerminal:
         if _powershell_prompt_at_end(captured):
             self._in_ssh = False
             self._ssh_target = ""  # 3.1: clear target on exit
+        # --- 3.4 Detect SSH disconnect from captured output ---
+        elif self._in_ssh:
+            cap_lower = captured.casefold()
+            if ("connection to " in cap_lower and "closed" in cap_lower) or \
+               "connection closed by" in cap_lower or \
+               (cap_lower.rstrip().endswith("logout") and _powershell_prompt_at_end(captured)):
+                self._in_ssh = False
+                self._ssh_target = ""
 
         elapsed = time.monotonic() - start
         return CommandResult(command=cmd, exit_code=0, stdout=captured, stderr="", elapsed_s=float(elapsed), cwd_after=str(self.cwd))
@@ -1338,6 +1584,7 @@ class _Worker(QtCore.QThread):
         terminal: Any,
         max_rounds: int,
         hide_think: bool,
+        scratchpad: dict[str, str] | None = None,
         parent: Optional[QtCore.QObject],
     ) -> None:
         super().__init__(parent)
@@ -1346,6 +1593,7 @@ class _Worker(QtCore.QThread):
         self.terminal = terminal
         self.max_rounds = int(max_rounds)
         self.hide_think = hide_think
+        self.scratchpad = scratchpad if scratchpad is not None else {}
         self.signals = _Signals()
         self._pause_flag = threading.Event()
 
@@ -1406,6 +1654,13 @@ class _Worker(QtCore.QThread):
                 full_raw = ""
                 last_emit = 0.0
                 last_tok_emit = 0.0
+
+                # --- 4.4 Inject scratchpad into context ---
+                if self.scratchpad:
+                    sp_lines = "\n".join(f"{k}: {v}" for k, v in self.scratchpad.items())
+                    scratchpad_block = f"\n[Scratchpad]\n{sp_lines}\n[/Scratchpad]\n"
+                    pending_user = scratchpad_block + pending_user
+
                 prompt_tok_est = self.session.estimate_prompt_tokens(user_text=pending_user)
                 max_ctx = int(getattr(self.session.cfg, "context_window_tokens", 0) or 0)
 
@@ -1465,7 +1720,8 @@ class _Worker(QtCore.QThread):
                         continue
                     return
 
-                self.signals.tool_msg.emit(f"[terminal] executing {len(blocks)} block(s)…")
+                # (suppressed – noisy UX)
+                # self.signals.tool_msg.emit(f"[terminal] executing {len(blocks)} block(s)…")
                 results: list[CommandResult] = []
                 # Keep only the most recent <Terminal> block as context, with a rolling line window.
                 latest_window = _truncate_terminal_lines(blocks[-1], max_lines=200)
@@ -1582,6 +1838,8 @@ class _TabState:
     worker: _Worker | None
     paused: bool
     tokens_text: str
+    # 4.4: persistent scratchpad — survives conversation compaction
+    scratchpad: dict[str, str]
     # UI widgets (per tab)
     chat_scroll: QtWidgets.QScrollArea
     chat_layout: QtWidgets.QVBoxLayout
@@ -1668,6 +1926,13 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             "- If it fails, try the next option. Do NOT ask the user which option to choose unless ALL options have failed.\n"
             "- If a command fails, analyze the error, determine the fix, and continue autonomously.\n"
             "\n"
+            "Scratchpad (persistent memory):\n"
+            "- You have a persistent scratchpad that survives conversation compaction. It is injected as [Scratchpad]...[/Scratchpad] at the start of each prompt.\n"
+            "- Use `scratchpad_set(key, value)` to store important context: current task, step progress, SSH host, last error, key decisions.\n"
+            "- Use `scratchpad_clear(key)` to remove a key, or `scratchpad_clear()` to clear all.\n"
+            "- At the START of a multi-step task, save the plan (e.g. scratchpad_set('task', '...'), scratchpad_set('step', '1/5')).\n"
+            "- Update the scratchpad as you make progress so you can recover if context is compacted.\n"
+            "\n"
             + (
                 "Manager role (Main only):\n"
                 "- Delegate terminal work to other agents (T2, T3, ...) via peer_agent_ask / peer_terminal_run.\n"
@@ -1690,6 +1955,14 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             pass
         try:
             s.registry.add(tool_spec=_ssh_replace_line_tool_spec(), handler=_ssh_replace_line_handler)
+        except Exception:
+            pass
+        try:
+            s.registry.add(tool_spec=_ssh_run_command_tool_spec(), handler=_ssh_run_command_handler)
+        except Exception:
+            pass
+        try:
+            s.registry.add(tool_spec=_ssh_patch_file_tool_spec(), handler=_ssh_patch_file_handler)
         except Exception:
             pass
         return s
@@ -1984,6 +2257,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             worker=None,
             paused=False,
             tokens_text="",
+            scratchpad={},
             chat_scroll=chat_scroll,
             chat_layout=chat_layout,
             terminal_view=terminal_view,
@@ -2104,6 +2378,64 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         try:
             session.registry.add(tool_spec=_peer_terminal_run_tool_spec(), handler=peer_terminal_run)
             session.registry.add(tool_spec=_peer_agent_ask_tool_spec(), handler=peer_agent_ask)
+        except Exception:
+            pass
+
+        # --- 4.4 Persistent scratchpad tools ---
+        def scratchpad_set(args: JsonDict) -> str:
+            key = args.get("key", "")
+            value = args.get("value", "")
+            if not isinstance(key, str) or not key.strip():
+                return json.dumps({"ok": False, "error": "key must be a non-empty string"})
+            st.scratchpad[key.strip()] = str(value)
+            return json.dumps({"ok": True, "key": key.strip(), "scratchpad_size": len(st.scratchpad)})
+
+        def scratchpad_clear(args: JsonDict) -> str:
+            key = args.get("key", "")
+            if isinstance(key, str) and key.strip():
+                removed = st.scratchpad.pop(key.strip(), None)
+                return json.dumps({"ok": True, "removed": removed is not None})
+            else:
+                st.scratchpad.clear()
+                return json.dumps({"ok": True, "cleared": True})
+
+        try:
+            session.registry.add(
+                tool_spec={
+                    "type": "function",
+                    "name": "scratchpad_set",
+                    "description": (
+                        "Store a key-value note in your persistent scratchpad. "
+                        "Use this to remember important context (SSH host, current task, step progress, "
+                        "last error) that survives conversation compaction."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string", "description": "Note key (e.g. 'ssh_host', 'task', 'step')."},
+                            "value": {"type": "string", "description": "Note value."},
+                        },
+                        "required": ["key", "value"],
+                        "additionalProperties": False,
+                    },
+                },
+                handler=scratchpad_set,
+            )
+            session.registry.add(
+                tool_spec={
+                    "type": "function",
+                    "name": "scratchpad_clear",
+                    "description": "Clear a key from your scratchpad, or clear all if key is empty.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string", "description": "Key to remove (empty = clear all).", "default": ""},
+                        },
+                        "additionalProperties": False,
+                    },
+                },
+                handler=scratchpad_clear,
+            )
         except Exception:
             pass
 
@@ -2410,6 +2742,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             terminal=st.terminal,
             max_rounds=self._rounds_spin.value(),
             hide_think=self._hide_think,
+            scratchpad=st.scratchpad,
             parent=self,
         )
         st.worker = w
@@ -2430,6 +2763,16 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
         def on_final(t: str) -> None:
             nonlocal assistant_bubble
+            # If the final text is empty (e.g. response was only <Terminal> blocks
+            # or <think> content), discard the bubble instead of leaving an empty blob.
+            if not t.strip():
+                if assistant_bubble is not None:
+                    container = assistant_bubble.parent()
+                    if container is not None:
+                        container.setParent(None)
+                        container.deleteLater()
+                assistant_bubble = None
+                return
             if assistant_bubble is None:
                 assistant_bubble = self._append_chat("", kind="assistant", tab_id=st.tab_id)
             assistant_bubble.set_text(t)
