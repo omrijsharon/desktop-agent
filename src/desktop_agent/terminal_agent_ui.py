@@ -1933,6 +1933,11 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             "- At the START of a multi-step task, save the plan (e.g. scratchpad_set('task', '...'), scratchpad_set('step', '1/5')).\n"
             "- Update the scratchpad as you make progress so you can recover if context is compacted.\n"
             "\n"
+            "Planning skill:\n"
+            "- For multi-step projects (3+ steps), use the `plan_update` tool to create and track a structured plan.\n"
+            "- Read `docs/plan_skill.md` with `read_file` for the full format reference on first use.\n"
+            "- Plans are persisted as Markdown files; scratchpad keys `plan_file`, `current_task`, `task_status` are maintained automatically.\n"
+            "\n"
             + (
                 "Manager role (Main only):\n"
                 "- Delegate terminal work to other agents (T2, T3, ...) via peer_agent_ask / peer_terminal_run.\n"
@@ -2435,6 +2440,172 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                     },
                 },
                 handler=scratchpad_clear,
+            )
+        except Exception:
+            pass
+
+        # --- 4.5 Plan tool (skill-based planning) ---
+        def plan_update(args: JsonDict) -> str:
+            action = args.get("action", "")
+            plan_dir = _repo_root()
+
+            if action == "create":
+                title = args.get("title", "Plan")
+                tasks = args.get("tasks", [])
+                fname = args.get("file", "plan.md")
+                if not tasks:
+                    return json.dumps({"ok": False, "error": "tasks list is required"})
+                lines = [f"# {title}", ""]
+                lines.append("## Tasks")
+                lines.append("")
+                for i, t in enumerate(tasks):
+                    marker = "[>]" if i == 0 else "[ ]"
+                    lines.append(f"- {marker} {i + 1}. {t}")
+                plan_path = os.path.join(plan_dir, fname)
+                with open(plan_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+                st.scratchpad["plan_file"] = fname
+                st.scratchpad["current_task"] = tasks[0]
+                st.scratchpad["task_status"] = f"1/{len(tasks)} — {tasks[0]}"
+                return json.dumps({"ok": True, "file": fname, "total_tasks": len(tasks), "current": tasks[0]})
+
+            elif action == "next":
+                fname = st.scratchpad.get("plan_file", "plan.md")
+                plan_path = os.path.join(plan_dir, fname)
+                if not os.path.isfile(plan_path):
+                    return json.dumps({"ok": False, "error": f"plan file not found: {fname}"})
+                note = args.get("note", "")
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                plan_lines = content.splitlines()
+                active_idx = None
+                for i, ln in enumerate(plan_lines):
+                    if ln.strip().startswith("- [>]"):
+                        active_idx = i
+                        break
+                if active_idx is None:
+                    return json.dumps({"ok": False, "error": "no active task found ([>])"})
+                # Mark active as done
+                completed_line = plan_lines[active_idx].replace("- [>]", "- [x]", 1)
+                if note:
+                    completed_line += f" ✓ {note}"
+                plan_lines[active_idx] = completed_line
+                # Find next pending task
+                next_idx = None
+                for i in range(active_idx + 1, len(plan_lines)):
+                    if plan_lines[i].strip().startswith("- [ ]"):
+                        next_idx = i
+                        break
+                if next_idx is not None:
+                    plan_lines[next_idx] = plan_lines[next_idx].replace("- [ ]", "- [>]", 1)
+                with open(plan_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(plan_lines) + "\n")
+                # Count progress
+                total = sum(1 for ln in plan_lines if ln.strip().startswith("- ["))
+                done = sum(1 for ln in plan_lines if ln.strip().startswith("- [x]"))
+                if next_idx is not None:
+                    # Extract task text after "N. "
+                    raw = plan_lines[next_idx].strip()
+                    task_text = raw.split("] ", 1)[-1] if "] " in raw else raw
+                    st.scratchpad["current_task"] = task_text
+                    st.scratchpad["task_status"] = f"{done + 1}/{total} — {task_text}"
+                    return json.dumps({"ok": True, "done": done, "total": total, "current": task_text})
+                else:
+                    st.scratchpad["current_task"] = "(all done)"
+                    st.scratchpad["task_status"] = f"{done}/{total} — all complete"
+                    return json.dumps({"ok": True, "done": done, "total": total, "current": None, "all_complete": True})
+
+            elif action == "complete":
+                fname = st.scratchpad.get("plan_file", "plan.md")
+                plan_path = os.path.join(plan_dir, fname)
+                note = args.get("note", "")
+                if os.path.isfile(plan_path):
+                    with open(plan_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    plan_lines = content.splitlines()
+                    for i, ln in enumerate(plan_lines):
+                        if ln.strip().startswith("- [>]") or ln.strip().startswith("- [ ]"):
+                            plan_lines[i] = ln.replace("- [>]", "- [x]", 1).replace("- [ ]", "- [x]", 1)
+                    if note:
+                        plan_lines.append(f"\n> ✓ Completed: {note}")
+                    with open(plan_path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(plan_lines) + "\n")
+                st.scratchpad.pop("current_task", None)
+                st.scratchpad.pop("task_status", None)
+                # Keep plan_file so user can review
+                return json.dumps({"ok": True, "status": "plan marked complete"})
+
+            elif action == "status":
+                fname = st.scratchpad.get("plan_file", "plan.md")
+                plan_path = os.path.join(plan_dir, fname)
+                if not os.path.isfile(plan_path):
+                    return json.dumps({"ok": False, "error": f"no plan file found: {fname}"})
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                plan_lines = content.splitlines()
+                total = sum(1 for ln in plan_lines if ln.strip().startswith("- ["))
+                done = sum(1 for ln in plan_lines if ln.strip().startswith("- [x]"))
+                active = None
+                for ln in plan_lines:
+                    if ln.strip().startswith("- [>]"):
+                        raw = ln.strip()
+                        active = raw.split("] ", 1)[-1] if "] " in raw else raw
+                        break
+                return json.dumps({
+                    "ok": True,
+                    "file": fname,
+                    "total": total,
+                    "done": done,
+                    "active": active,
+                    "plan": content,
+                })
+
+            else:
+                return json.dumps({"ok": False, "error": f"unknown action: {action!r}. Use create/next/complete/status."})
+
+        try:
+            session.registry.add(
+                tool_spec={
+                    "type": "function",
+                    "name": "plan_update",
+                    "description": (
+                        "Create and track structured project plans. "
+                        "Actions: 'create' (new plan with tasks), 'next' (mark current task done, advance), "
+                        "'complete' (mark whole plan done), 'status' (read plan state). "
+                        "See docs/plan_skill.md for full format reference."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["create", "next", "complete", "status"],
+                                "description": "The plan action to perform.",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Plan title (for 'create' action).",
+                            },
+                            "tasks": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Ordered list of task descriptions (for 'create' action).",
+                            },
+                            "file": {
+                                "type": "string",
+                                "description": "Plan filename (default: plan.md).",
+                                "default": "plan.md",
+                            },
+                            "note": {
+                                "type": "string",
+                                "description": "Optional note for 'next' or 'complete' actions.",
+                            },
+                        },
+                        "required": ["action"],
+                        "additionalProperties": False,
+                    },
+                },
+                handler=plan_update,
             )
         except Exception:
             pass
