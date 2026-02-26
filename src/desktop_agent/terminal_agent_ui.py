@@ -46,6 +46,7 @@ _LINUX_PROMPT_RE = re.compile(r"(?m)^[^\r\n]{0,80}@[^\r\n]{1,80}:[^\r\n]{0,200}[
 
 class _UiBridge(QtCore.QObject):
     append_chat = QtCore.Signal(str, str, str)  # tab_id, kind, text
+    plan_changed = QtCore.Signal()  # emitted after any plan_update action
 
 
 def _repo_root() -> Path:
@@ -1858,6 +1859,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         self._active_tab_id: str | None = None
         self._ui_bridge = _UiBridge(self)
         self._ui_bridge.append_chat.connect(self._on_append_chat, QtCore.Qt.ConnectionType.QueuedConnection)
+        self._ui_bridge.plan_changed.connect(self._refresh_plan_panel, QtCore.Qt.ConnectionType.QueuedConnection)
         self._prompt_overrides: dict[str, str] = _load_terminal_agent_prompt_overrides(base_dir=_repo_root())
 
         self._build_ui()
@@ -1985,7 +1987,39 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
 
         splitter = QtWidgets.QSplitter()
         splitter.setOrientation(QtCore.Qt.Orientation.Horizontal)
+        self._splitter = splitter
         outer.addWidget(splitter, 1)
+
+        # Plan pane (compact, hidden by default — shown when a plan exists)
+        self._plan_panel = QtWidgets.QFrame()
+        self._plan_panel.setObjectName("panel")
+        self._plan_panel.setVisible(False)
+        pl = QtWidgets.QVBoxLayout(self._plan_panel)
+        pl.setContentsMargins(8, 10, 8, 10)
+        pl.setSpacing(6)
+        self._plan_title_label = QtWidgets.QLabel("Plan")
+        self._plan_title_label.setObjectName("title")
+        self._plan_title_label.setStyleSheet("font-size: 13px;")
+        pl.addWidget(self._plan_title_label)
+        self._plan_tree = QtWidgets.QTreeWidget()
+        self._plan_tree.setHeaderHidden(True)
+        self._plan_tree.setRootIsDecorated(True)
+        self._plan_tree.setIndentation(16)
+        self._plan_tree.setColumnCount(1)
+        self._plan_tree.setAnimated(False)
+        self._plan_tree.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self._plan_tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        self._plan_tree.setStyleSheet(
+            "QTreeWidget { background: transparent; border: none; font-size: 12px; color: #e0e8f0; }"
+            "QTreeWidget::item { padding: 2px 0px; }"
+            "QTreeWidget::branch { background: transparent; }"
+        )
+        pl.addWidget(self._plan_tree, 1)
+        self._plan_progress = QtWidgets.QLabel("")
+        self._plan_progress.setObjectName("subtitle")
+        self._plan_progress.setStyleSheet("font-size: 11px; color: rgba(200,220,255,0.6);")
+        pl.addWidget(self._plan_progress)
+        splitter.addWidget(self._plan_panel)
 
         # Left: chat
         chat_panel = QtWidgets.QFrame()
@@ -2102,7 +2136,9 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
         tl.addWidget(self._term_tabs, 1)
 
         splitter.addWidget(term_panel)
-        splitter.setSizes([860, 820])
+        # Sizes: [plan_panel, chat_panel, term_panel]
+        # Plan panel starts hidden, so its initial size is 0.
+        splitter.setSizes([0, 860, 820])
 
         # wiring
         self._btn_send.clicked.connect(self._on_send)
@@ -2166,6 +2202,8 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
             pass
         # --- 5.1 Refresh SSH status on tab switch ---
         self._update_ssh_status(tid)
+        # Refresh plan panel for the newly active tab
+        self._refresh_plan_panel()
 
     def _on_tab_close_requested(self, index: int) -> None:
         if self._term_tabs.count() <= 1:
@@ -2467,6 +2505,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 st.scratchpad["plan_file"] = fname
                 st.scratchpad["current_task"] = tasks[0]
                 st.scratchpad["task_status"] = f"1/{len(tasks)} — {tasks[0]}"
+                self._ui_bridge.plan_changed.emit()
                 return json.dumps({"ok": True, "file": fname, "total_tasks": len(tasks), "current": tasks[0]})
 
             elif action == "next":
@@ -2509,10 +2548,12 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                     task_text = raw.split("] ", 1)[-1] if "] " in raw else raw
                     st.scratchpad["current_task"] = task_text
                     st.scratchpad["task_status"] = f"{done + 1}/{total} — {task_text}"
+                    self._ui_bridge.plan_changed.emit()
                     return json.dumps({"ok": True, "done": done, "total": total, "current": task_text})
                 else:
                     st.scratchpad["current_task"] = "(all done)"
                     st.scratchpad["task_status"] = f"{done}/{total} — all complete"
+                    self._ui_bridge.plan_changed.emit()
                     return json.dumps({"ok": True, "done": done, "total": total, "current": None, "all_complete": True})
 
             elif action == "complete":
@@ -2533,6 +2574,7 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 st.scratchpad.pop("current_task", None)
                 st.scratchpad.pop("task_status", None)
                 # Keep plan_file so user can review
+                self._ui_bridge.plan_changed.emit()
                 return json.dumps({"ok": True, "status": "plan marked complete"})
 
             elif action == "status":
@@ -3028,6 +3070,121 @@ class TerminalAgentWindow(QtWidgets.QMainWindow):
                 "QLabel { padding: 2px 8px; border-radius: 4px; font-size: 12px; "
                 "background-color: #2a2a2a; color: #aaa; }"
             )
+
+    # ---- Plan panel ----
+
+    _PLAN_MARKER_RE = re.compile(r"^(\s*)- \[([x >-])\]\s*(?:\d+\.\s*)?(.+)$")
+
+    @QtCore.Slot()
+    def _refresh_plan_panel(self) -> None:
+        """Re-read the active plan file and update the plan tree widget."""
+        st = self._active_tab()
+        fname = st.scratchpad.get("plan_file") if st else None
+        if not fname:
+            self._plan_panel.setVisible(False)
+            self._splitter.setSizes([0] + self._splitter.sizes()[1:])
+            return
+
+        plan_path = os.path.join(_repo_root(), fname)
+        if not os.path.isfile(plan_path):
+            self._plan_panel.setVisible(False)
+            self._splitter.setSizes([0] + self._splitter.sizes()[1:])
+            return
+
+        try:
+            with open(plan_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            return
+
+        lines = content.splitlines()
+
+        # Parse title (first # heading)
+        title = "Plan"
+        for ln in lines:
+            if ln.startswith("# "):
+                title = ln[2:].strip()
+                break
+        self._plan_title_label.setText(title)
+
+        # Parse tasks — detect indentation level for sub-task grouping
+        tasks: list[tuple[int, str, str]] = []  # (indent_level, marker, text)
+        for ln in lines:
+            m = self._PLAN_MARKER_RE.match(ln)
+            if m:
+                indent = len(m.group(1))
+                marker = m.group(2)
+                text = m.group(3).strip()
+                # Strip trailing " ✓ ..." notes for compact display
+                if " ✓ " in text:
+                    text = text.split(" ✓ ")[0].strip()
+                tasks.append((indent, marker, text))
+
+        if not tasks:
+            self._plan_panel.setVisible(False)
+            return
+
+        # Determine base indent (minimum indent among tasks)
+        base_indent = min(t[0] for t in tasks)
+
+        # Build tree
+        self._plan_tree.clear()
+        total = len(tasks)
+        done = sum(1 for _, mk, _ in tasks if mk == "x")
+
+        # Marker to icon/prefix mapping
+        def _marker_prefix(marker: str) -> str:
+            if marker == "x":
+                return "✅ "
+            elif marker == ">":
+                return "▶ "
+            elif marker == "-":
+                return "⏭ "
+            else:
+                return "⬜ "
+
+        # Stack-based tree building: items at indent 0 are roots, deeper = children
+        parent_stack: list[tuple[int, QtWidgets.QTreeWidgetItem]] = []
+
+        for indent, marker, text in tasks:
+            level = (indent - base_indent) // 2  # normalize to 0, 1, 2, ...
+            display = _marker_prefix(marker) + text
+
+            # Find the right parent
+            while parent_stack and parent_stack[-1][0] >= level:
+                parent_stack.pop()
+
+            if parent_stack:
+                item = QtWidgets.QTreeWidgetItem(parent_stack[-1][1])
+            else:
+                item = QtWidgets.QTreeWidgetItem(self._plan_tree)
+
+            item.setText(0, display)
+
+            # Style: dim completed, bold active
+            if marker == "x":
+                item.setForeground(0, QtGui.QColor(140, 160, 180))
+            elif marker == ">":
+                f = item.font(0)
+                f.setBold(True)
+                item.setFont(0, f)
+                item.setForeground(0, QtGui.QColor(100, 220, 255))
+            elif marker == "-":
+                item.setForeground(0, QtGui.QColor(120, 130, 140))
+
+            parent_stack.append((level, item))
+
+        self._plan_tree.expandAll()
+        self._plan_progress.setText(f"{done}/{total} tasks done")
+
+        # Show panel and adjust splitter if it was hidden
+        if not self._plan_panel.isVisible():
+            self._plan_panel.setVisible(True)
+            # Set plan panel to ~1/3 of chat width
+            sizes = self._splitter.sizes()
+            chat_w = sizes[1] if len(sizes) > 1 else 860
+            plan_w = max(180, chat_w // 3)
+            self._splitter.setSizes([plan_w, sizes[1] if len(sizes) > 1 else 860, sizes[2] if len(sizes) > 2 else 820])
 
 
 def main() -> None:
